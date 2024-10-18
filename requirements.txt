@@ -1,0 +1,12 @@
+openai
+spacy
+qdrant-client
+python-dotenv
+pyyaml
+aiohttp
+beautifulsoup4
+fuzzywuzzy
+python-spellchecker
+matplotlib
+wordcloud
+scikit-learn
