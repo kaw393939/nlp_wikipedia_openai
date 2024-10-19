@@ -162,12 +162,6 @@ cython_debug/
 # VS Code
 .vscode/
 
-# Project-specific
-output/
-stories/
-config.yaml
-*.log
-story_processor.log
 
 # Qdrant
 qdrant_storage/
