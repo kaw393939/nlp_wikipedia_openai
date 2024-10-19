@@ -181,7 +181,7 @@ class ConfigManager:
                 }
             elif model_type == ModelType.CHAT:
                 return {
-                    'model': models_config.get('chat_model', 'gpt-4'),  # Corrected model name
+                    'model': models_config.get('chat_model', 'chatgpt-4o-latest'),  # Corrected model name
                     'max_tokens': int(models_config.get('max_tokens', 1000)),  # Adjusted max_tokens
                     'temperature': float(models_config.get('temperature', 0.7))
                 }
@@ -650,7 +650,7 @@ class StoryProcessor:
         try:
             model_config = self.config_manager.get_model_config(ModelType.CHAT)
             # Initialize tokenizer
-            tokenizer = tiktoken.get_encoding("gpt-4")  # Use the appropriate encoding for your model
+            tokenizer = tiktoken.get_encoding("cl100k_base")  # Use the appropriate encoding for your model
             # Calculate tokens
             total_tokens = sum([len(tokenizer.encode(msg["content"])) for msg in messages])
             max_context_length = 8192  # For gpt-4
