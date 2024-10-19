@@ -1,13 +1,14 @@
-# Configuration file for Story Processor Application
+# Configuration file for Story Processor Application with Enhanced Design and Logging
 
 # OpenAI Configuration
 openai:
   settings:
-    embedding_model: "text-embedding-ada-002"
-    chat_model: "chatgpt-4o-latest"    
-    timeout: 30.0
-    max_tokens: 100000
-    temperature: 0.7
+    api_key: "your_openai_api_key_here"  # Replace with your actual OpenAI API key
+    embedding_model: "text-embedding-3-small"  # Updated embedding model
+    chat_model: "gpt-4o"  # Updated to a high-capacity model
+    timeout: 60.0  # Increased timeout to handle longer processing
+    max_tokens: 10000  # Adjusted max_tokens to align with standard context length
+    temperature: 1.0  # Higher temperature for more creative outputs
 
 # Qdrant Configuration
 qdrant:
@@ -22,6 +23,7 @@ qdrant:
       name: "reports_collection411"
       vector_size: 1536
       distance: "COSINE"
+    retrieve_limit: 1000  # Increased number of reports to retrieve per batch for faster access
 
 # Prompts Configuration
 prompts:
@@ -30,18 +32,18 @@ prompts:
       You are an expert AI assistant specializing in news analysis and report refinement. Your task is to enhance reports by integrating relevant Wikipedia information and providing comprehensive context.
     user: |
       Your goal is to refine and improve a generated report about a news story by effectively utilizing the provided Wikipedia information to add context and depth.
-
+      
       **Original Story:**
       {original_story}
-
+      
       **Generated Report:**
       {generated_report}
-
+      
       **Wikipedia Information:**
       {wikipedia_info}
-
+      
       Please perform the following tasks:
-
+      
       1. **Integrate Wikipedia Information:**  
          - Seamlessly incorporate the relevant Wikipedia information into the generated report.
          - Ensure that the added content enhances the understanding of the story by providing:
@@ -49,39 +51,115 @@ prompts:
            - Explanations of technical terms or concepts.
            - Relevant past events or trends related to the current story.
            - Biographical information about key figures, if applicable.
-
+      
       2. **Enhance Clarity and Coherence:**  
          - Improve the overall flow and readability of the report.
          - Ensure that the integration of additional information does not disrupt the narrative but instead enhances it.
-
+      
       3. **Fact-Check and Correct Inaccuracies:**  
          - Cross-reference the original report with the Wikipedia information to identify and correct any inaccuracies or misinterpretations.
-
+      
       4. **Ensure Relevance of Entities:**  
          - Verify that all entities mentioned in the report are directly related to the story.
          - Remove or minimize references to entities that do not contribute to the core narrative or analysis.
-
-      5. **Summarize Integrated Information:**  
+      
+      5. **Explain Decision-Making Process:**  
+         - For each significant addition or modification, provide a brief explanation of why it was included and how it enhances the report.
+         - Detail the rationale behind the selection of specific Wikipedia information to integrate.
+      
+      6. **Provide Annotations:**  
+         - After each section or paragraph, include an annotation explaining the reason for its inclusion and how it relates to the overall analysis.
+      
+      7. **Highlight Reasoning Chains:**  
+         - Clearly indicate how conclusions about various entities were derived from the integrated information.
+         - Trace the logical flow from the original story to the refined analysis.
+      
+      8. **Summarize Integrated Information:**  
          - At the end of the report, provide a concise summary of all the integrated Wikipedia articles.
          - Highlight the key points from each article that were utilized in enhancing the report.
-
+      
       **Deliverable:**  
-      Provide a refined version of the report that incorporates the above enhancements, effectively utilizing Wikipedia information to create a more informative and contextually rich analysis.
-
+      Provide a refined version of the report that incorporates the above enhancements, effectively utilizing Wikipedia information to create a more informative and contextually rich analysis. Additionally, include explanations of the decisions made during the refinement process to understand how conclusions about various entities were reached.
+  
   summary_generation:
     system: |
       You are an expert AI assistant specializing in summarizing multiple reports into a cohesive summary. Your task is to distill the essential points from each report to create a comprehensive and concise summary.
     user: |
       Please create a comprehensive summary based on the following refined reports:
-
+      
       {reports}
-
+      
       Ensure that the summary:
       
       - Captures the key insights and findings from each individual report.
       - Highlights common themes, trends, and significant points across all reports.
       - Maintains clarity and coherence, providing a clear overview without unnecessary detail.
       - Reflects the enhanced context and information derived from Wikipedia integrations in the individual reports.
-
+      - Explains the reasoning behind the identification of key themes and trends.
+      
       **Deliverable:**  
-      Provide a concise and informative summary that encapsulates the key points from all the refined reports, offering a comprehensive overview of the analyzed stories.
+      Provide a concise and informative summary that encapsulates the key points from all the refined reports, offering a comprehensive overview of the analyzed stories. Additionally, include explanations of how common themes and trends were identified based on the individual analyses.
+  
+  entity_suggestion:
+    system: |
+      You are an assistant that suggests alternative names for entities.
+    user: |
+      Given the entity '{entity}', suggest alternative names that might be used to find it on Wikipedia. For each suggestion, provide a brief explanation of why it might be a more effective search term.
+      
+      **Entity:** {entity}
+      
+      **Suggested Alternatives:**
+      1. 
+      2. 
+      3. 
+      
+      **Deliverable:**  
+      Provide a list of alternative names with explanations to help locate the most accurate Wikipedia page for the given entity.
+
+# Logging Configuration
+logging:
+  level: "DEBUG"  # Set to DEBUG for maximum verbosity
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers:
+    main_file: "logs/main.log"
+    wikipedia_file: "logs/wikipedia.log"
+    llm_file: "logs/llm.log"
+    error_file: "logs/errors.log"
+  stream: true  # Enable console logging
+
+# Retry Configuration
+retry:
+  retries: 5  # Increased number of retry attempts
+  base_delay: 0.5  # Reduced base delay to retry faster
+  factor: 1.5  # Moderate backoff factor
+  buffer_tokens: 1500  # Increased buffer for completions
+  summary_buffer_tokens: 800  # Increased buffer for summary generation
+  summary_max_tokens: 2000  # Increased max_tokens for summaries
+
+# Aiohttp Configuration
+aiohttp:
+  timeout: 60  # Increased timeout to handle longer requests
+
+# Process Pool Configuration
+process_pool:
+  max_workers: 32  # Increased number of workers for parallel processing (ensure system can handle)
+
+# Paths Configuration
+paths:
+  config_dir: "config"
+  stories_dir: "stories"
+  output_dir: "output"
+  output_report_path: "output/report.md"
+  summary_output_path: "output/summary_report.md"
+  intermediary_dir: "output/intermediary"
+  visualizations_dir: "output/visualizations"
+
+# Concurrency Configuration
+concurrency:
+  semaphore_limit: 64  # Increased semaphore limit to allow more concurrent tasks
+
+# Analysis Configuration
+analysis:
+  content_max_chars: 5000  # Increased maximum characters for content processing
+  entities_limit: 100  # Increased limit for the number of entities
+  wiki_info_max_chars: 8000  # Increased maximum characters for Wikipedia information
