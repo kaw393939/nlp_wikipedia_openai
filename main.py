@@ -7,11 +7,10 @@ from openai import AsyncOpenAI
 import spacy
 from typing import Dict, List, Optional, Any
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.models import Record
-
 from qdrant_client.http.exceptions import UnexpectedResponse
 from dotenv import load_dotenv
 from dataclasses import dataclass
@@ -29,13 +28,17 @@ import matplotlib.pyplot as plt
 from wordcloud import WordCloud
 from sklearn.manifold import TSNE
 from collections import defaultdict
-import tiktoken  # For accurate token counting
+import tiktoken
+import aiofiles
+import plotly.express as px
+import numpy as np  # Ensure NumPy is imported
 
-# ------------------------------
-# Monkey-Patch BeautifulSoup in Wikipedia
-# ------------------------------
+import threading
+
+# Suppress specific warnings
 warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
 
+# Patch BeautifulSoup to use 'html.parser' by default
 original_bs_constructor = BeautifulSoup
 
 def patched_bs_constructor(html, *args, **kwargs):
@@ -43,50 +46,84 @@ def patched_bs_constructor(html, *args, **kwargs):
 
 BeautifulSoup = patched_bs_constructor
 
-# ------------------------------
-# Exception Classes
-# ------------------------------
+# Custom Exceptions
 class ConfigError(Exception):
-    """Custom exception for configuration errors."""
     pass
 
 class ProcessingError(Exception):
-    """Custom exception for processing errors."""
     pass
 
-# ------------------------------
 # Enum for Model Types
-# ------------------------------
 class ModelType(Enum):
     EMBEDDING = "embedding"
     CHAT = "chat"
 
-# ------------------------------
 # Dataclass for Processing Results
-# ------------------------------
 @dataclass
 class ProcessingResult:
     success: bool
     data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
-# ------------------------------
-# ConfigManager Class (Singleton)
-# ------------------------------
+# Retry Decorators
+def retry_async(retries=3, base_delay=1.0, factor=2.0):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            attempt = 0
+            delay = base_delay
+            while attempt < retries:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    attempt += 1
+                    if attempt >= retries:
+                        raise
+                    logger = args[0].loggers.get('llm', logging.getLogger('llm'))
+                    logger.warning(f"Attempt {attempt} failed: {e}. Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    delay *= factor
+        return wrapper
+    return decorator
+
+def retry_sync(retries=3, base_delay=1.0, factor=2.0):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            delay = base_delay
+            while attempt < retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    attempt += 1
+                    if attempt >= retries:
+                        raise
+                    logger = args[0].loggers.get('llm', logging.getLogger('llm'))
+                    logger.warning(f"Attempt {attempt} failed: {e}. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    delay *= factor
+        return wrapper
+    return decorator
+
+# Config Manager Class
 class ConfigManager:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls, config_dir: str = "config"):
         if cls._instance is None:
-            cls._instance = super(ConfigManager, cls).__new__(cls)
-            cls._instance.config_dir = Path(config_dir)
-            cls._instance.config = {}
-            cls._instance._load_configs()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(ConfigManager, cls).__new__(cls)
+                    cls._instance.config_dir = Path(config_dir)
+                    cls._instance.config = {}
+                    cls._instance._load_configs()
         return cls._instance
 
     def _read_yaml_file(self, filepath: Path) -> Dict[str, Any]:
         try:
-            with open(filepath, 'r', encoding='utf-8') as file:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as file:
                 return yaml.safe_load(file)
         except FileNotFoundError:
             raise ConfigError(f"Configuration file not found: {filepath}")
@@ -101,7 +138,13 @@ class ConfigManager:
             if not config_path.exists():
                 raise ConfigError(f"Configuration file does not exist: {config_path}")
             self.config = self._read_yaml_file(config_path)
-            logging.getLogger('main').info("Configuration loaded successfully")
+            required_sections = ['openai', 'qdrant', 'prompts', 'logging', 'retry', 'aiohttp', 'process_pool', 'paths', 'concurrency', 'analysis']
+            for section in required_sections:
+                if section not in self.config:
+                    raise ConfigError(f"Missing required configuration section: '{section}'")
+            if 'settings' not in self.config['openai'] or 'api_key' not in self.config['openai']['settings']:
+                raise ConfigError("Missing 'api_key' in 'openai.settings' section")
+            logging.getLogger('main').info("Configuration loaded and validated successfully")
             logging.getLogger('main').debug(f"Loaded Configurations: {self.config}")
         except Exception as e:
             logging.getLogger('errors').error(f"Failed to load configuration: {str(e)}")
@@ -121,13 +164,15 @@ class ConfigManager:
             if model_type == ModelType.EMBEDDING:
                 return {
                     'model': models_config.get('embedding_model', 'text-embedding-ada-002'),
-                    'timeout': float(models_config.get('timeout', 30.0))
+                    'timeout': float(models_config.get('timeout', 30.0)),
+                    'context_length': models_config.get('context_length', 8192)
                 }
             elif model_type == ModelType.CHAT:
                 return {
-                    'model': models_config.get('chat_model', 'gpt-4'),  # Corrected model name to 'gpt-4'
+                    'model': models_config.get('chat_model', 'gpt-4'),
                     'max_tokens': int(models_config.get('max_tokens', 4096)),
-                    'temperature': float(models_config.get('temperature', 0.7))
+                    'temperature': float(models_config.get('temperature', 0.7)),
+                    'context_length': models_config.get('context_length', 8192)
                 }
             raise ValueError(f"Unknown model type: {model_type}")
         except KeyError as e:
@@ -157,9 +202,7 @@ class ConfigManager:
     def get_analysis_config(self) -> Dict[str, Any]:
         return self.config.get('analysis', {})
 
-# ------------------------------
-# LoggerFactory Class (Factory Pattern)
-# ------------------------------
+# Logger Factory Class
 class LoggerFactory:
     def __init__(self, config_manager: ConfigManager):
         self.config_manager = config_manager
@@ -167,15 +210,14 @@ class LoggerFactory:
         self._create_loggers()
 
     def _create_loggers(self):
+        # Load logging configuration from logging.yaml
         logging_config = self.config_manager.get_logging_config()
         level_str = logging_config.get('level', 'INFO').upper()
         level = getattr(logging, level_str, logging.INFO)
         log_format = logging_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-        # Create formatter
         formatter = logging.Formatter(log_format)
 
-        # Define logger names and their respective handler configurations
+        # Define logger configurations
         logger_definitions = {
             'main': {
                 'level': level,
@@ -204,85 +246,27 @@ class LoggerFactory:
             }
         }
 
+        # Create and configure each logger
         for logger_name, props in logger_definitions.items():
             logger = logging.getLogger(logger_name)
             logger.setLevel(props['level'])
-
             for handler_name, handler in props['handlers']:
                 if isinstance(handler, logging.FileHandler):
-                    # Ensure the parent directory exists
                     log_file_path = Path(handler.baseFilename)
                     try:
                         log_file_path.parent.mkdir(parents=True, exist_ok=True)
-                    except Exception as e:
-                        print(f"Failed to create log directory for {logger_name}: {e}")
-                        continue  # Skip adding this handler if directory creation fails
-
+                    except Exception:
+                        continue
                 handler.setLevel(props['level'])
                 handler.setFormatter(formatter)
                 logger.addHandler(handler)
-
-            # Prevent log messages from propagating to the root logger
             logger.propagate = False
             self.loggers[logger_name] = logger
 
     def get_logger(self, name: str) -> logging.Logger:
         return self.loggers.get(name, logging.getLogger('main'))
 
-# ------------------------------
-# Retry Decorator with Exponential Backoff (Decorator Pattern)
-# ------------------------------
-def retry_on_exception(func):
-    @wraps(func)
-    async def async_wrapper(self, *args, **kwargs):
-        retries = self.config_manager.get_retry_config().get('retries', 3)
-        base_delay = self.config_manager.get_retry_config().get('base_delay', 1.0)
-        factor = self.config_manager.get_retry_config().get('factor', 2.0)
-        last_exception = None
-        delay = base_delay
-
-        for attempt in range(1, retries + 1):
-            try:
-                return await func(self, *args, **kwargs)
-            except Exception as e:
-                last_exception = e
-                self.loggers['llm'].warning(f"Attempt {attempt} failed: {str(e)}. Retrying in {delay} seconds...")
-                if attempt < retries:
-                    await asyncio.sleep(delay)
-                    delay *= factor
-
-        self.loggers['llm'].error(f"All {retries} attempts failed: {str(last_exception)}")
-        raise last_exception
-
-    @wraps(func)
-    def sync_wrapper(self, *args, **kwargs):
-        retries = self.config_manager.get_retry_config().get('retries', 3)
-        base_delay = self.config_manager.get_retry_config().get('base_delay', 1.0)
-        factor = self.config_manager.get_retry_config().get('factor', 2.0)
-        last_exception = None
-        delay = base_delay
-
-        for attempt in range(1, retries + 1):
-            try:
-                return func(self, *args, **kwargs)
-            except Exception as e:
-                last_exception = e
-                self.loggers['llm'].warning(f"Attempt {attempt} failed: {str(e)}. Retrying in {delay} seconds...")
-                if attempt < retries:
-                    time.sleep(delay)
-                    delay *= factor
-
-        self.loggers['llm'].error(f"All {retries} attempts failed: {str(last_exception)}")
-        raise last_exception
-
-    if asyncio.iscoroutinefunction(func):
-        return async_wrapper
-    else:
-        return sync_wrapper
-
-# ------------------------------
-# EnhancedEntityProcessor Class (Facade Pattern)
-# ------------------------------
+# Enhanced Entity Processor Class
 class EnhancedEntityProcessor:
     def __init__(self, openai_client: AsyncOpenAI, config_manager: ConfigManager, loggers: Dict[str, logging.Logger]):
         self.wikipedia_cache = {}
@@ -292,39 +276,52 @@ class EnhancedEntityProcessor:
         self.loggers = loggers
         aiohttp_config = self.config_manager.get_aiohttp_config()
         timeout_seconds = aiohttp_config.get('timeout', 30)
+        max_connections = aiohttp_config.get('max_connections', 10)  # Limit to 10 concurrent connections
+        connector = aiohttp.TCPConnector(limit=max_connections)
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        self.session = aiohttp.ClientSession(timeout=timeout)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        self.rate_limit = aiohttp_config.get('rate_limit', 5)  # Max 5 requests per second
+        self.semaphore = asyncio.Semaphore(self.rate_limit)
+        self.token_bucket = asyncio.Queue(maxsize=self.rate_limit)
+        asyncio.create_task(self._fill_token_bucket())
+
+    async def _fill_token_bucket(self):
+        while True:
+            if not self.token_bucket.full():
+                await self.token_bucket.put(1)
+            await asyncio.sleep(1 / self.rate_limit)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
 
     async def close(self):
         await self.session.close()
 
-    @retry_on_exception
+    @retry_async()
     async def suggest_alternative_entity_name(self, entity: str) -> Optional[str]:
-        """
-        Use OpenAI to suggest an alternative entity name when Wikipedia page is not found.
-        """
         prompt_system = self.config_manager.get_prompt('entity_suggestion', 'system') or "You are an assistant that suggests alternative names for entities."
         prompt_user_template = self.config_manager.get_prompt('entity_suggestion', 'user') or "Given the entity '{entity}', suggest alternative names that might be used to find it on Wikipedia."
         prompt_user = prompt_user_template.format(entity=entity)
-
         messages = [
             {"role": "system", "content": prompt_system},
             {"role": "user", "content": prompt_user}
         ]
-
         self.loggers['llm'].debug(f"Messages sent to OpenAI for entity suggestion: {messages}")
-
         try:
             response = await self.openai_client.chat.completions.create(
                 model=self.config_manager.get_model_config(ModelType.CHAT)['model'],
                 messages=messages,
-                max_tokens=50,  # Limit to 50 tokens
-                temperature=0.3  # Lower temperature for more deterministic output
+                max_tokens=50,
+                temperature=0.3
             )
+            if not response.choices or not response.choices[0].message:
+                self.loggers['llm'].error("OpenAI response is missing choices or messages.")
+                return None
             suggestion = response.choices[0].message.content.strip()
-            # Extract the first line or suggestion
             suggestion = suggestion.split('\n')[0].replace('.', '').strip()
-            # Validate that the suggestion is a plausible entity name
             if suggestion.lower() in ["hello! how can i assist you today?"]:
                 self.loggers['llm'].error(f"Invalid suggestion received from OpenAI: '{suggestion}'")
                 return None
@@ -334,110 +331,217 @@ class EnhancedEntityProcessor:
             self.loggers['llm'].error(f"Failed to suggest alternative entity name for '{entity}': {str(e)}")
             return None
 
-    @retry_on_exception
+    @retry_async()
+    async def get_wikidata_id(self, entity: str) -> Optional[str]:
+        """
+        Fetch the Wikidata ID for a given entity using the Wikidata API.
+        """
+        await self.token_bucket.get()
+        wikidata_api_url = "https://www.wikidata.org/w/api.php"
+        params = {
+            "action": "wbsearchentities",
+            "format": "json",
+            "language": "en",
+            "search": entity
+        }
+        try:
+            async with self.session.get(wikidata_api_url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get('search'):
+                        return data['search'][0].get('id')
+            self.loggers['wikipedia'].warning(f"No Wikidata ID found for entity '{entity}'.")
+            return None
+        except Exception as e:
+            self.loggers['wikipedia'].error(f"Error fetching Wikidata ID for '{entity}': {e}")
+            return None
+
+    @retry_async()
+    async def validate_entity(self, wikidata_id: str) -> bool:
+        """
+        Validate the entity by checking essential properties on Wikidata.
+        """
+        await self.token_bucket.get()
+        wikidata_api_url = f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
+        try:
+            async with self.session.get(wikidata_api_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    entity_data = data.get('entities', {}).get(wikidata_id, {})
+                    claims = entity_data.get('claims', {})
+                    # Example: Check if the entity has an occupation (P106)
+                    if 'P106' in claims:
+                        return True
+            self.loggers['wikipedia'].warning(f"Entity '{wikidata_id}' lacks essential properties.")
+            return False
+        except Exception as e:
+            self.loggers['wikipedia'].error(f"Error validating entity '{wikidata_id}': {e}")
+            return False
+
+    @retry_async()
+    async def get_entity_sections(self, title: str) -> Dict[str, Any]:
+        """
+        Fetch specific sections from a Wikipedia page.
+        """
+        await self.token_bucket.get()
+        sections_api_url = f"https://en.wikipedia.org/api/rest_v1/page/mobile-sections/{title}"
+        try:
+            async with self.session.get(sections_api_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    sections = data.get('sections', [])
+                    section_contents = {}
+                    for section in sections:
+                        section_title = section.get('title', 'No Title')
+                        section_text = section.get('text', '')
+                        if section_text:
+                            section_contents[section_title] = section_text
+                    return section_contents
+                else:
+                    self.loggers['wikipedia'].error(f"Wikipedia sections request failed for '{title}' with status code {resp.status}")
+                    return {}
+        except Exception as e:
+            self.loggers['wikipedia'].error(f"Exception during Wikipedia sections request for '{title}': {e}")
+            return {}
+
+    @retry_async()
     async def get_entity_info(self, entity: str, context: str, retry: bool = True) -> Dict[str, Any]:
         if entity in self.wikipedia_cache:
             self.loggers['wikipedia'].debug(f"Entity '{entity}' found in Wikipedia cache")
             return self.wikipedia_cache[entity]
-
         self.loggers['wikipedia'].debug(f"Fetching Wikipedia info for entity '{entity}'")
         try:
-            async with self.session.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{entity}") as resp:
+            wikidata_id = await self.get_wikidata_id(entity)
+            if not wikidata_id:
+                return {"error": f"No Wikidata ID found for '{entity}'."}
+            is_valid = await self.validate_entity(wikidata_id)
+            if not is_valid:
+                self.loggers['wikipedia'].warning(f"Entity '{entity}' with Wikidata ID '{wikidata_id}' is invalid.")
+                return {"error": f"Entity '{entity}' is invalid based on Wikidata properties."}
+
+            # Fetch Wikidata entity data
+            wikidata_api_url = f"https://www.wikidata.org/wiki/Special:EntityData/{wikidata_id}.json"
+            async with self.session.get(wikidata_api_url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    info = {
-                        "title": data.get('title', 'No title available'),
-                        "summary": data.get('extract', 'No summary available'),
-                        "url": data.get('content_urls', {}).get('desktop', {}).get('page', '#'),
-                        "categories": data.get('categories', [])[:5] if data.get('categories') else []
-                    }
-                    self.wikipedia_cache[entity] = info
-                    self.loggers['wikipedia'].debug(f"Retrieved Wikipedia info for '{entity}': {info}")
-                    return info
-                elif resp.status == 404 and retry:
-                    self.loggers['wikipedia'].warning(f"Wikipedia page not found for '{entity}'. Attempting to suggest alternative name.")
-                    alternative_entity = await self.suggest_alternative_entity_name(entity)
-                    if alternative_entity and alternative_entity != entity:
-                        return await self.get_entity_info(alternative_entity, context, retry=False)
-                    else:
-                        self.loggers['wikipedia'].warning(f"No Wikipedia page found for '{entity}' and no alternative could be suggested.")
-                        return {"error": f"No Wikipedia page found for '{entity}' and no alternative could be suggested."}
-                else:
-                    self.loggers['wikipedia'].error(f"Wikipedia request failed for '{entity}' with status code {resp.status}")
-                    return {"error": f"Wikipedia request failed for '{entity}' with status code {resp.status}"}
-        except Exception as e:
-            self.loggers['wikipedia'].error(f"Exception during Wikipedia request for '{entity}': {str(e)}")
-            return {"error": f"Exception during Wikipedia request for '{entity}': {str(e)}"}
+                    entities = data.get('entities', {})
+                    entity_data = entities.get(wikidata_id, {})
+                    sitelinks = entity_data.get('sitelinks', {})
+                    enwiki = sitelinks.get('enwiki', {})
+                    wikipedia_title = enwiki.get('title')
+                    if not wikipedia_title:
+                        self.loggers['wikipedia'].warning(f"No English Wikipedia page found for '{entity}'.")
+                        return {"error": f"No English Wikipedia page found for '{entity}'."}
 
-    @retry_on_exception
-    async def get_entities_info(self, entities: List[str], context: str) -> Dict[str, Dict[str, Any]]:
+                    # Fetch Wikipedia summary
+                    await self.token_bucket.get()
+                    async with self.session.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{wikipedia_title}") as summary_resp:
+                        if summary_resp.status == 200:
+                            summary_data = await summary_resp.json()
+                            # Check if page is a disambiguation page
+                            if 'disambiguation' in [cat.get('title', '').lower() for cat in summary_data.get('categories', [])]:
+                                self.loggers['wikipedia'].warning(f"Entity '{entity}' leads to a disambiguation page.")
+                                alternative_entity = await self.suggest_alternative_entity_name(entity)
+                                if alternative_entity and alternative_entity != entity:
+                                    return await self.get_entity_info(alternative_entity, context, retry=False)
+                                else:
+                                    self.loggers['wikipedia'].warning(f"No suitable alternative could be suggested for disambiguated entity '{entity}'.")
+                                    return {"error": f"Entity '{entity}' is ambiguous and no suitable alternative was found."}
+
+                            info = {
+                                "wikidata_id": wikidata_id,
+                                "title": summary_data.get('title', 'No title available'),
+                                "summary": summary_data.get('extract', 'No summary available'),
+                                "url": summary_data.get('content_urls', {}).get('desktop', {}).get('page', '#'),
+                                "categories": [cat.get('title', '') for cat in summary_data.get('categories', [])][:5],
+                                "type": summary_data.get('type', 'UNKNOWN'),
+                                "aliases": [alias.get('value') for alias in entity_data.get('aliases', {}).get('en', [])]
+                            }
+
+                            # Fetch Wikipedia sections
+                            sections = await self.get_entity_sections(wikipedia_title)
+                            info.update({"sections": sections})
+
+                            # Enhanced Entity Resolution: Cross-reference aliases to prevent misspellings
+                            if not info['aliases']:
+                                info['aliases'] = [entity]
+                            else:
+                                info['aliases'] = list(set(info['aliases'] + [entity]))
+
+                            # Cache the complete info
+                            self.wikipedia_cache[entity] = info
+                            self.loggers['wikipedia'].debug(f"Retrieved and cached Wikipedia info for '{entity}': {info}")
+                            return info
+                        elif summary_resp.status == 404 and retry:
+                            self.loggers['wikipedia'].warning(f"Wikipedia page not found for '{wikipedia_title}'. Attempting to suggest alternative name.")
+                            alternative_entity = await self.suggest_alternative_entity_name(entity)
+                            if alternative_entity and alternative_entity != entity:
+                                return await self.get_entity_info(alternative_entity, context, retry=False)
+                            else:
+                                self.loggers['wikipedia'].warning(f"No Wikipedia page found for '{entity}' and no alternative could be suggested.")
+                                return {"error": f"No Wikipedia page found for '{entity}' and no alternative could be suggested."}
+                        else:
+                            self.loggers['wikipedia'].error(f"Wikipedia summary request failed for '{wikipedia_title}' with status code {summary_resp.status}")
+                            return {"error": f"Wikipedia summary request failed for '{wikipedia_title}' with status code {summary_resp.status}"}
+        except Exception as e:
+            self.loggers['wikipedia'].error(f"Exception during Wikipedia request for '{entity}': {e}")
+            return {"error": f"Exception during Wikipedia request for '{entity}': {e}"}
+
+    @retry_async()
+    async def get_entities_info(self, entities: List[Dict[str, str]], context: str) -> Dict[str, Dict[str, Any]]:
         wiki_info = {}
         tasks = []
         for entity in entities:
-            tasks.append(self.get_entity_info(entity, context))
-
+            tasks.append(self.get_entity_info(entity['text'], context))
         self.loggers['wikipedia'].debug(f"Starting asynchronous fetching of entity info for entities: {entities}")
         results = await asyncio.gather(*tasks, return_exceptions=True)
         self.loggers['wikipedia'].debug("Completed asynchronous fetching of entity info")
-
         for entity, result in zip(entities, results):
             if isinstance(result, dict):
                 if "error" not in result:
-                    wiki_info[entity] = result
+                    wiki_info[entity['text']] = result
                 else:
-                    self.loggers['wikipedia'].warning(f"Failed to retrieve Wikipedia info for '{entity}': {result['error']}")
+                    self.loggers['wikipedia'].warning(f"Failed to retrieve Wikipedia info for '{entity['text']}': {result['error']}")
             elif isinstance(result, Exception):
-                self.loggers['wikipedia'].error(f"Exception during information lookup for '{entity}': {str(result)}")
+                self.loggers['wikipedia'].error(f"Exception during information lookup for '{entity['text']}': {str(result)}")
             else:
-                self.loggers['wikipedia'].error(f"Unexpected result type for '{entity}': {type(result)}")
+                self.loggers['wikipedia'].error(f"Unexpected result type for '{entity['text']}': {type(result)}")
         return wiki_info
 
-# ------------------------------
-# ReportPostProcessor Class (Facade Pattern)
-# ------------------------------
+# Report Post Processor Class
 class ReportPostProcessor:
     def __init__(self, openai_client: AsyncOpenAI, config_manager: ConfigManager, loggers: Dict[str, logging.Logger]):
         self.openai_client = openai_client
         self.config_manager = config_manager
         self.loggers = loggers
-        # Initialize tokenizer
-        self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Use the appropriate encoding for your model
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
-    @retry_on_exception
-    async def refine_report(self, original_story: str, generated_report: str, wikipedia_info: str) -> str:
+    @retry_async()
+    async def refine_report(self, original_story: str, generated_report: str, wikipedia_info: str, wikipedia_sections: str) -> str:
         prompt_system = self.config_manager.get_prompt('report_refinement', 'system') or "You are a helpful assistant."
         prompt_user_template = self.config_manager.get_prompt('report_refinement', 'user') or "Refine the following report."
-
-        # Prepare the prompt
         prompt = prompt_user_template.format(
             original_story=original_story,
             generated_report=generated_report,
-            wikipedia_info=wikipedia_info
+            wikipedia_info=wikipedia_info,
+            wikipedia_sections=wikipedia_sections
         )
-
         messages = [
             {"role": "system", "content": prompt_system},
             {"role": "user", "content": prompt}
         ]
-
         self.loggers['llm'].debug(f"Messages sent to OpenAI for report refinement: {messages}")
-
-        # Calculate tokens
-        total_tokens = sum([len(self.tokenizer.encode(msg["content"])) for msg in messages])
+        input_tokens = sum([len(self.tokenizer.encode(msg["content"])) for msg in messages])
         model_config = self.config_manager.get_model_config(ModelType.CHAT)
-        max_context_length = model_config['max_tokens']
-        buffer_tokens = self.config_manager.get_retry_config().get('buffer_tokens', 1000)  # Reserve for the completion and buffer
-        available_tokens = max_context_length - total_tokens - buffer_tokens
-
-        self.loggers['llm'].debug(f"Total tokens in prompt: {total_tokens}")
+        max_context_length = model_config['context_length']
+        buffer_tokens = self.config_manager.get_retry_config().get('buffer_tokens', 1000)
+        available_tokens = max_context_length - input_tokens - buffer_tokens
+        self.loggers['llm'].debug(f"Total tokens in prompt: {input_tokens}")
         self.loggers['llm'].debug(f"Available tokens for completion: {available_tokens}")
-
         if available_tokens <= 0:
             self.loggers['llm'].error("Refine report: Not enough tokens available for completion.")
             return generated_report
-
-        max_completion_tokens = min(available_tokens, model_config['max_tokens'])
-
+        max_completion_tokens = min(model_config['max_tokens'], available_tokens)
         try:
             response = await self.openai_client.chat.completions.create(
                 model=model_config['model'],
@@ -445,58 +549,48 @@ class ReportPostProcessor:
                 max_tokens=max_completion_tokens,
                 temperature=model_config['temperature']
             )
+            if not response.choices or not response.choices[0].message:
+                self.loggers['llm'].error("OpenAI response is missing choices or messages.")
+                return generated_report
             refined_report = response.choices[0].message.content.strip()
             self.loggers['llm'].debug(f"Refined report generated.")
             return refined_report
         except Exception as e:
             self.loggers['llm'].error(f"Failed to refine report: {str(e)}")
-            return generated_report  # Return original report if refinement fails
+            return generated_report
 
-    @retry_on_exception
+    @retry_async()
     async def generate_summary(self, reports: List[str]) -> str:
-        prompt_system = self.config_manager.get_prompt('summary_generation', 'system') or "You are a helpful assistant."
-        prompt_user = self.config_manager.get_prompt('summary_generation', 'user') or "Summarize the following reports."
-
-        # Prepare the prompt
-        max_reports_tokens = 3000  # Adjust this value based on your needs
+        prompt_system = self.config_manager.get_prompt('summary_generation', 'system') or "You are an expert AI assistant specializing in synthesizing multiple reports into a cohesive, comprehensive, and insightful summary. Your role is to distill essential points from each report to create a detailed and informative overview."
+        prompt_user = self.config_manager.get_prompt('summary_generation', 'user') or "Please generate a comprehensive and in-depth summary based on the following refined reports:"
+        max_reports_tokens = 3000
         formatted_reports = []
         total_tokens = 0
-
         for i, report in enumerate(reports):
             report_tokens = len(self.tokenizer.encode(report))
             if total_tokens + report_tokens > max_reports_tokens:
                 break
             formatted_reports.append(f"Report {i+1}:\n{report}")
             total_tokens += report_tokens
-
         if not formatted_reports:
             return "No reports available to summarize due to token limit constraints."
-
         prompt = prompt_user.format(reports='\n\n'.join(formatted_reports))
-
         messages = [
             {"role": "system", "content": prompt_system},
             {"role": "user", "content": prompt}
         ]
-
         self.loggers['llm'].debug(f"Messages sent to OpenAI for summary generation: {messages}")
-
-        # Calculate tokens
-        total_tokens = sum([len(self.tokenizer.encode(msg["content"])) for msg in messages])
+        input_tokens = sum([len(self.tokenizer.encode(msg["content"])) for msg in messages])
         model_config = self.config_manager.get_model_config(ModelType.CHAT)
-        max_context_length = model_config['max_tokens']
+        max_context_length = model_config['context_length']
         buffer_tokens = self.config_manager.get_retry_config().get('summary_buffer_tokens', 500)
-        available_tokens = max_context_length - total_tokens - buffer_tokens
-
-        self.loggers['llm'].debug(f"Total tokens in summary prompt: {total_tokens}")
+        available_tokens = max_context_length - input_tokens - buffer_tokens
+        self.loggers['llm'].debug(f"Total tokens in summary prompt: {input_tokens}")
         self.loggers['llm'].debug(f"Available tokens for summary completion: {available_tokens}")
-
         if available_tokens <= 0:
             self.loggers['llm'].error("Generate summary: Not enough tokens available for completion.")
             return "Summary generation failed due to insufficient context. Too many reports to summarize."
-
-        max_completion_tokens = min(available_tokens, self.config_manager.get_retry_config().get('summary_max_tokens', 1000))
-
+        max_completion_tokens = min(self.config_manager.get_retry_config().get('summary_max_tokens', 1000), available_tokens)
         try:
             response = await self.openai_client.chat.completions.create(
                 model=model_config['model'],
@@ -504,53 +598,43 @@ class ReportPostProcessor:
                 max_tokens=max_completion_tokens,
                 temperature=model_config['temperature']
             )
+            if not response.choices or not response.choices[0].message:
+                self.loggers['llm'].error("OpenAI response is missing choices or messages.")
+                return "Summary generation failed due to an error."
             summary = response.choices[0].message.content.strip()
             self.loggers['llm'].debug("Generated summary report.")
-            
             if len(formatted_reports) < len(reports):
                 summary += f"\n\nNote: This summary is based on {len(formatted_reports)} out of {len(reports)} total reports due to token limitations."
-            
             return summary
         except Exception as e:
             self.loggers['llm'].error(f"Failed to generate summary: {str(e)}")
             return "Summary generation failed due to an error."
 
-    @retry_on_exception
-    async def _generate_analysis_async(self, content: str, entities: List[str], wiki_info: Dict[str, Dict[str, Any]]) -> str:
+    @retry_async()
+    async def generate_analysis(self, content: str, entities: List[Dict[str, str]], wiki_info: Dict[str, Dict[str, Any]]) -> str:
         prompt_system = self.config_manager.get_prompt('analysis', 'system') or "You are an assistant that analyzes stories based on their content and entities."
         prompt_user = self.config_manager.get_prompt('analysis', 'user') or "Analyze the following content and entities."
-
-        # Prepare the prompt with necessary truncation
         analysis_config = self.config_manager.get_analysis_config()
-        content_truncated = self.truncate_text(content, analysis_config.get('content_max_chars', 2000))
-        entities_truncated = ', '.join(entities[:analysis_config.get('entities_limit', 50)])  # Limit to first 50 entities
-        wiki_info_truncated = json.dumps(wiki_info, indent=2)[:analysis_config.get('wiki_info_max_chars', 4000)]  # Limit to first 4000 characters
-
+        content_truncated = self.truncate_text(content, analysis_config.get('content_max_chars', 5000))
+        entities_truncated = ', '.join([entity['text'] for entity in entities[:analysis_config.get('entities_limit', 100)]])
+        wiki_info_truncated = json.dumps(wiki_info, indent=2)[:analysis_config.get('wiki_info_max_chars', 8000)]
         prompt_user_formatted = f"{prompt_user}\n\nContent: {content_truncated}\n\nEntities: {entities_truncated}\n\nEntity Information:\n{wiki_info_truncated}"
-
         messages = [
             {"role": "system", "content": prompt_system},
             {"role": "user", "content": prompt_user_formatted}
         ]
-
         self.loggers['llm'].debug(f"Messages sent to OpenAI for analysis: {messages}")
-
-        # Calculate tokens
-        total_tokens = sum([len(self.tokenizer.encode(msg["content"])) for msg in messages])
+        input_tokens = sum([len(self.tokenizer.encode(msg["content"])) for msg in messages])
         model_config = self.config_manager.get_model_config(ModelType.CHAT)
-        max_context_length = model_config['max_tokens']
-        buffer_tokens = self.config_manager.get_retry_config().get('buffer_tokens', 500)  # Reserve for the completion and buffer
-        available_tokens = max_context_length - total_tokens - buffer_tokens
-
-        self.loggers['llm'].debug(f"Total tokens in analysis prompt: {total_tokens}")
+        max_context_length = model_config['context_length']
+        buffer_tokens = self.config_manager.get_retry_config().get('buffer_tokens', 500)
+        available_tokens = max_context_length - input_tokens - buffer_tokens
+        self.loggers['llm'].debug(f"Total tokens in analysis prompt: {input_tokens}")
         self.loggers['llm'].debug(f"Available tokens for analysis completion: {available_tokens}")
-
         if available_tokens <= 0:
             self.loggers['llm'].error("Generate analysis: Not enough tokens available for completion.")
             raise ProcessingError("Prompt is too long to generate a valid completion.")
-
-        max_completion_tokens = min(available_tokens, model_config['max_tokens'])
-
+        max_completion_tokens = min(model_config['max_tokens'], available_tokens)
         try:
             response = await self.openai_client.chat.completions.create(
                 model=model_config['model'],
@@ -558,6 +642,9 @@ class ReportPostProcessor:
                 max_tokens=max_completion_tokens,
                 temperature=model_config['temperature']
             )
+            if not response.choices or not response.choices[0].message:
+                self.loggers['llm'].error("OpenAI response is missing choices or messages.")
+                raise ProcessingError("Failed to generate analysis due to invalid OpenAI response.")
             analysis = response.choices[0].message.content.strip()
             self.loggers['llm'].debug(f"Generated analysis for content: {content[:30]}... [truncated]")
             return analysis
@@ -568,38 +655,45 @@ class ReportPostProcessor:
     def truncate_text(self, text: str, max_chars: int) -> str:
         return text if len(text) <= max_chars else text[:max_chars] + "..."
 
-    async def process_full_report(self, stories: Dict[str, str], generated_report: str, wiki_info: Dict[str, Dict[str, Any]]) -> str:
-        sections = generated_report.split("## Story ID:")
-        refined_sections = []
-
-        tasks = []
-        for section in sections[1:]:  # Skip the first empty section
-            story_id = section.split("\n")[0].strip()
-            original_story = stories.get(story_id, "")
-            story_wiki_info = wiki_info.get(story_id, {})
-            wikipedia_info_str = json.dumps(story_wiki_info, indent=2)  # Convert dict to formatted string
-            tasks.append(self.refine_report(original_story, f"## Story ID:{section}", wikipedia_info_str))
-
-        refined_sections = await asyncio.gather(*tasks, return_exceptions=True)
-
-        final_sections = []
-        for refined in refined_sections:
-            if isinstance(refined, str):
-                final_sections.append(refined)
-            elif isinstance(refined, Exception):
-                self.loggers['llm'].error(f"Error refining a section: {str(refined)}")
-                final_sections.append("## Refinement Failed\n")
+    async def process_full_report(self, processed_results: List[ProcessingResult]) -> str:
+        report_lines = ["# Refined Analysis Report", ""]
+        unique_entities = {}
+        for result in processed_results:
+            if result.success and result.data:
+                data = result.data
+                story_id = data.get('story_id', 'Unknown')
+                report_lines.append(f"## Story ID: {story_id}")
+                entities = data.get('entities', [])
+                for entity in entities:
+                    wikidata_id = data.get('wiki_info', {}).get(entity['text'], {}).get('wikidata_id')
+                    if wikidata_id and wikidata_id not in unique_entities:
+                        unique_entities[wikidata_id] = {
+                            "text": entity['text'],
+                            "type": entity['type'],
+                            "info": data.get('wiki_info', {}).get(entity['text'], {})
+                        }
+                if unique_entities:
+                    report_lines.append("### Entities:")
+                    report_lines.append("| Entity | Type | Wikidata ID |")
+                    report_lines.append("|--------|------|-------------|")
+                    for eid, details in unique_entities.items():
+                        report_lines.append(f"| {details['text']} | {details['type']} | {eid} |")
+                else:
+                    report_lines.append("### Entities: None found")
+                analysis = data.get('analysis', 'No analysis available')
+                report_lines.append("### Analysis:")
+                report_lines.append(analysis)
+                report_lines.append("")
             else:
-                self.loggers['llm'].error(f"Unexpected refinement result type: {type(refined)}")
-                final_sections.append("## Refinement Failed\n")
+                error_message = result.error if result.error else "Unknown error"
+                report_lines.append(f"## Failed to process story: {error_message}")
+                report_lines.append("")
+        report_content = '\n'.join(report_lines)
+        self.loggers['main'].info("Generated refined analysis report.")
+        return report_content
 
-        return "# Refined Analysis Report\n\n" + "\n\n".join(final_sections)
-
-# ------------------------------
-# StoryProcessor Class (Facade Pattern)
-# ------------------------------
+# Story Processor Class
 class StoryProcessor:
-
     def __init__(self, config_manager: ConfigManager, loggers: Dict[str, logging.Logger]):
         self.config_manager = config_manager
         self.loggers = loggers
@@ -646,14 +740,10 @@ class StoryProcessor:
                 timeout=self.config_manager.get_model_config(ModelType.EMBEDDING)['timeout']
             )
             self.loggers['main'].info("Qdrant client initialized successfully.")
-
-            # Initialize Stories Collection
             self.stories_collection_name = qdrant_config.get('stories_collection', {}).get('name', 'stories_collection')
             self.vector_size = int(qdrant_config.get('stories_collection', {}).get('vector_size', 1536))
             distance_metric_stories = qdrant_config.get('stories_collection', {}).get('distance', 'COSINE').upper()
             self._initialize_collection(self.stories_collection_name, self.vector_size, distance_metric_stories, 'stories')
-
-            # Initialize Reports Collection
             self.reports_collection_name = qdrant_config.get('reports_collection', {}).get('name', 'reports_collection')
             reports_vector_size = int(qdrant_config.get('reports_collection', {}).get('vector_size', 1536))
             distance_metric_reports = qdrant_config.get('reports_collection', {}).get('distance', 'COSINE').upper()
@@ -675,7 +765,6 @@ class StoryProcessor:
                 )
                 self.loggers['main'].info(f"Created Qdrant collection: {collection_name}")
             else:
-                # Check if the existing collection matches the expected configuration
                 collection_info = self.qdrant_client.get_collection(collection_name)
                 if collection_info.config.params.vectors.size != vector_size or \
                    collection_info.config.params.vectors.distance != models.Distance[distance_metric]:
@@ -690,7 +779,7 @@ class StoryProcessor:
         self.entity_processor = EnhancedEntityProcessor(self.openai_client, self.config_manager, self.loggers)
         self.loggers['main'].info("EnhancedEntityProcessor initialized.")
 
-    @retry_on_exception
+    @retry_async()
     async def _get_embedding_async(self, text: str) -> List[float]:
         try:
             model_config = self.config_manager.get_model_config(ModelType.EMBEDDING)
@@ -698,6 +787,9 @@ class StoryProcessor:
                 input=[text],
                 model=model_config['model']
             )
+            if not response.data or not response.data[0].embedding:
+                self.loggers['llm'].error("OpenAI response is missing embedding data.")
+                raise ProcessingError("Failed to generate embedding due to invalid OpenAI response.")
             embedding = response.data[0].embedding
             self.loggers['llm'].debug(f"Generated embedding for text: {text[:30]}... [truncated]. Embedding size: {len(embedding)}")
             return embedding
@@ -708,12 +800,11 @@ class StoryProcessor:
     def _prepare_qdrant_points(self, collection_name: str, point_id: str, content: str, wiki_info: Dict[str, Any], embedding: List[float], story_id: str) -> List[models.PointStruct]:
         if not isinstance(embedding, list) or len(embedding) != self.vector_size:
             raise ValueError(f"Invalid embedding: expected list of length {self.vector_size}")
-
         payload = {
             'report_id': point_id,
             'story_id': story_id,
             'content': content,
-            'wiki_info': json.dumps(wiki_info),  # Convert dict to JSON string
+            'wiki_info': json.dumps(wiki_info),
             'timestamp': datetime.now().isoformat()
         }
         point = models.PointStruct(
@@ -725,7 +816,6 @@ class StoryProcessor:
         return [point]
 
     def _generate_report_id(self) -> str:
-        # Generate a unique report ID as a standalone UUID
         return str(uuid.uuid4())
 
     def _store_points_in_qdrant_sync(self, collection_name: str, points: List[models.PointStruct]) -> None:
@@ -735,7 +825,6 @@ class StoryProcessor:
                 points=points
             )
             self.loggers['main'].info(f"Stored {len(points)} point(s) in Qdrant collection '{collection_name}'. Operation ID: {operation_info.operation_id}")
-            # Removed wait_for_operation as 'wait=True' in upsert ensures completion
             self.loggers['main'].info(f"Upsert operation completed for collection '{collection_name}'")
         except UnexpectedResponse as e:
             raise ProcessingError(f"Failed to store points in Qdrant: {str(e)}")
@@ -743,67 +832,56 @@ class StoryProcessor:
             raise ProcessingError(f"An unexpected error occurred while storing points in Qdrant: {str(e)}")
 
     async def _store_points_in_qdrant(self, collection_name: str, points: List[models.PointStruct]) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._store_points_in_qdrant_sync, collection_name, points)
 
-    @retry_on_exception
+    @retry_async()
     async def process_story_async(self, story_id: str, content: str) -> ProcessingResult:
         try:
             self.loggers['main'].debug(f"Starting preprocessing for story '{story_id}'")
-
-            corrected_content = await asyncio.get_event_loop().run_in_executor(
+            corrected_content = await asyncio.get_running_loop().run_in_executor(
                 self.process_pool, preprocess_text_worker, content
             )
             self.loggers['main'].debug(f"Preprocessing completed for story '{story_id}'")
-
-            resolved_entities = await asyncio.get_event_loop().run_in_executor(
+            resolved_entities = await asyncio.get_running_loop().run_in_executor(
                 self.process_pool, extract_and_resolve_entities_worker, corrected_content
             )
             self.loggers['main'].debug(f"Entities extracted for story '{story_id}': {resolved_entities}")
-
             wiki_info = await self.entity_processor.get_entities_info(resolved_entities, corrected_content)
-
             self.loggers['llm'].debug(f"Generating embedding for story '{story_id}'")
             embedding = await self._get_embedding_async(corrected_content)
             self.loggers['llm'].debug(f"Embedding generated for story '{story_id}'")
-
-            # Save Embedding
-            self._save_intermediary_data(
+            await self._save_intermediary_data_async(
                 data=embedding,
                 path=f"embeddings/{story_id}.json",
                 data_type='embedding'
             )
-
-            # Generate a UUID for the story's point_id
             story_uuid = self._generate_report_id()
             points = self._prepare_qdrant_points(self.stories_collection_name, story_uuid, corrected_content, wiki_info, embedding, story_id)
-
             await self._store_points_in_qdrant(self.stories_collection_name, points)
             self.loggers['main'].debug(f"Stored embedding in Qdrant for story '{story_id}'")
-
             self.loggers['llm'].debug(f"Generating analysis for story '{story_id}'")
-            analysis = await self.report_post_processor._generate_analysis_async(corrected_content, resolved_entities, wiki_info)
+            analysis = await self.report_post_processor.generate_analysis(corrected_content, resolved_entities, wiki_info)
             self.loggers['llm'].debug(f"Analysis generated for story '{story_id}'")
-
-            # Save Analysis
-            self._save_intermediary_data(
+            await self._save_intermediary_data_async(
                 data=analysis,
                 path=f"analysis/{story_id}.json",
                 data_type='analysis'
             )
-
-            # Generate entity frequency chart
-            chart_path = self.generate_entity_frequency_chart(resolved_entities, story_id)
-
+            chart_path = await asyncio.get_running_loop().run_in_executor(
+                None, self.generate_entity_frequency_chart, resolved_entities, story_id
+            )
+            
+            # Pass processed_result directly to refined report
             result = {
                 'story_id': story_id,
                 'entities': resolved_entities,
                 'wiki_info': wiki_info,
-                'analysis': analysis,
+                'analysis': analysis,  # Use analysis directly without refinement to ensure detailed report
+                'embedding': embedding,
                 'timestamp': datetime.now().isoformat(),
-                'entity_frequency_chart': chart_path  # Path to the generated chart
+                'entity_frequency_chart': chart_path
             }
-
             self.loggers['main'].info(f"Successfully processed story '{story_id}'")
             return ProcessingResult(success=True, data=result)
         except ProcessingError as pe:
@@ -816,23 +894,17 @@ class StoryProcessor:
     async def process_stories_async(self, stories_dir: str, output_path: str, summary_output_path: str) -> None:
         try:
             self._load_stories(stories_dir)
-
-            # Limit the number of concurrent tasks to prevent overwhelming system resources
             concurrency_config = self.config_manager.get_concurrency_config()
             semaphore_limit = concurrency_config.get('semaphore_limit', multiprocessing.cpu_count() * 2)
-            semaphore = asyncio.Semaphore(semaphore_limit)  # Adjust as needed
-
+            semaphore = asyncio.Semaphore(semaphore_limit)
             async def semaphore_wrapper(story_id, content):
                 async with semaphore:
                     return await self.process_story_async(story_id, content)
-
             tasks = []
             for story_id, content in self.stories.items():
                 self.loggers['main'].info(f"Processing story: {story_id}")
                 tasks.append(semaphore_wrapper(story_id, content))
-
             results = await asyncio.gather(*tasks, return_exceptions=True)
-
             processed_results = []
             wiki_info = {}
             for result in results:
@@ -846,22 +918,18 @@ class StoryProcessor:
                 else:
                     self.loggers['errors'].error(f"Unexpected result type: {type(result)}")
                     processed_results.append(ProcessingResult(success=False, error="Unexpected result type"))
-
-            initial_report = self._generate_report(processed_results)
-
-            # Post-process the report
-            refined_report = await self.report_post_processor.process_full_report(self.stories, initial_report, wiki_info)
-
-            # Save the refined report
-            self._save_report(refined_report, output_path)
-
-            # Store individual refined reports in the reports_collection
+            
+            # Generate refined report from processed_results
+            refined_report = await self.report_post_processor.process_full_report(processed_results)
+            await self._save_report_async(refined_report, output_path)
+            
+            # Store refined reports in Qdrant
             for result in processed_results:
                 if result.success and result.data:
                     story_id = result.data['story_id']
                     report_content = result.data['analysis']
                     wiki_info_content = json.dumps(result.data['wiki_info'], indent=2)
-                    report_id = self._generate_report_id()  # Generate standalone UUID
+                    report_id = self._generate_report_id()
                     embedding = await self._get_embedding_async(report_content)
                     report_points = self._prepare_qdrant_points(
                         self.reports_collection_name,
@@ -869,138 +937,119 @@ class StoryProcessor:
                         report_content,
                         result.data['wiki_info'],
                         embedding,
-                        story_id  # Pass story_id
+                        story_id
                     )
                     await self._store_points_in_qdrant(self.reports_collection_name, report_points)
                     self.loggers['main'].info(f"Refined report for story '{story_id}' stored in '{self.reports_collection_name}' collection.")
-
-            # Retrieve all reports from the reports collection
-            self.loggers['main'].debug("Retrieving all reports from the reports collection for summary generation")
+            
+            # Retrieve all reports for summary
             all_reports = await self._retrieve_all_reports_async(self.reports_collection_name)
-
             if not all_reports:
                 self.loggers['main'].warning("No reports found in the reports collection to generate a summary.")
                 summary = "No reports available to generate a summary."
             else:
-                # Generate summary from all reports
                 self.loggers['llm'].debug("Generating summary from all stored reports")
                 summary = await self.report_post_processor.generate_summary(all_reports)
-
-            # Save the summary report
-            self._save_report(summary, summary_output_path)
-            self.loggers['main'].info(f"Summary report saved to {summary_output_path}")
-
-            # Generate additional visualizations
-            self.generate_word_cloud(processed_results, "word_cloud.png")
-            self.generate_entity_distribution(processed_results, "entity_distribution.png")
-            self.generate_embeddings_tsne(processed_results, "embeddings_tsne.png")
-            self.generate_story_length_histogram(processed_results, "story_length_histogram.png")
-
+            await self._save_report_async(summary, summary_output_path)
+            
+            # Generate visualizations
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.generate_word_cloud, processed_results, "word_cloud.png"
+            )
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.generate_entity_distribution, processed_results, "entity_distribution.html"  # Changed to HTML for Plotly
+            )
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.generate_embeddings_tsne, processed_results, "embeddings_tsne.png"
+            )
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.generate_story_length_histogram, processed_results, "story_length_histogram.png"
+            )
             self.loggers['main'].info(f"Processing complete. Refined reports saved to '{self.reports_collection_name}' and summary saved to {summary_output_path}")
         except Exception as e:
             self.loggers['errors'].error(f"Failed to process stories: {str(e)}", exc_info=True)
         finally:
-            # Close the EnhancedEntityProcessor session and Qdrant client
             if self.entity_processor:
-                await self.entity_processor.close()
+                try:
+                    await self.entity_processor.close()
+                except Exception as e:
+                    self.loggers['errors'].error(f"Failed to close entity processor session: {e}")
             if self.qdrant_client:
-                self.qdrant_client.close()  # Removed 'await'
-                self.loggers['main'].info("Qdrant client connection closed.")
-            # Shut down the process pool
+                try:
+                    self.qdrant_client.close()
+                    self.loggers['main'].info("Qdrant client connection closed.")
+                except Exception as e:
+                    self.loggers['errors'].error(f"Failed to close Qdrant client: {e}")
             if self.process_pool:
-                self.process_pool.shutdown(wait=True)
-                self.loggers['main'].info("Process pool shut down successfully.")
+                try:
+                    self.process_pool.shutdown(wait=True)
+                    self.loggers['main'].info("Process pool shut down successfully.")
+                except Exception as e:
+                    self.loggers['errors'].error(f"Failed to shut down process pool: {e}")
 
     def _load_stories(self, stories_dir: str) -> None:
         stories_path = Path(stories_dir)
         if not stories_path.exists() or not stories_path.is_dir():
             raise ProcessingError(f"Stories directory not found: {stories_dir}")
-
         self.stories = {}
         for story_file in stories_path.glob('*.md'):
             try:
-                with open(story_file, 'r', encoding='utf-8') as f:
-                    self.stories[story_file.stem] = f.read()
+                with open(story_file, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read().strip()
+                    if not content:
+                        self.loggers['wikipedia'].warning(f"Story file '{story_file}' is empty. Skipping.")
+                        continue
+                    self.stories[story_file.stem] = content
                     self.loggers['main'].debug(f"Loaded story '{story_file.stem}'")
             except Exception as e:
                 self.loggers['errors'].error(f"Failed to read story file '{story_file}': {str(e)}")
                 continue
-
         if not self.stories:
-            raise ProcessingError("No stories found to process.")
-
+            raise ProcessingError("No valid stories found to process.")
         self.loggers['main'].info(f"Loaded {len(self.stories)} story/stories for processing.")
 
-    # ------------------------------
-    # Report Generation Helper
-    # ------------------------------
-    def _generate_report(self, results: List[ProcessingResult]) -> str:
-        report_lines = ["# Analysis Report", ""]
-        for result in results:
-            if result.success and result.data:
-                data = result.data
-                story_id = data.get('story_id', 'Unknown')
-                report_lines.append(f"## Story ID: {story_id}")
-
-                entities = data.get('entities', [])
-                if entities:
-                    report_lines.append("### Entities:")
-                    report_lines.append("| Entity |")
-                    report_lines.append("|--------|")
-                    for entity in entities:
-                        report_lines.append(f"| {entity} |")
-                else:
-                    report_lines.append("### Entities: None found")
-
-                analysis = data.get('analysis', 'No analysis available')
-                report_lines.append("### Analysis:")
-                report_lines.append(analysis)
-
-                report_lines.append("")
-            else:
-                error_message = result.error if result.error else "Unknown error"
-                report_lines.append(f"## Failed to process story: {error_message}")
-                report_lines.append("")
-
-        report_content = '\n'.join(report_lines)
-        self.loggers['main'].info("Generated analysis report.")
-        return report_content
-
-    def _save_report(self, report_content: str, output_path: str) -> None:
+    async def _save_report_async(self, report_content: str, output_path: str) -> None:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(report_content)
+            async with aiofiles.open(output_file, 'w', encoding='utf-8', errors='replace') as f:
+                await f.write(report_content)
             self.loggers['main'].info(f"Report saved to {output_path}")
         except Exception as e:
             self.loggers['errors'].error(f"Failed to save report to '{output_path}': {str(e)}")
 
-    # ------------------------------
-    # Additional Visualizations
-    # ------------------------------
-    def generate_entity_frequency_chart(self, entities: List[str], story_id: str) -> Optional[str]:
-        """
-        Generate a bar chart for entity frequency and save it as an image.
-        Returns the path to the saved image.
-        """
+    async def _save_intermediary_data_async(self, data: Any, path: str, data_type: str) -> None:
+        intermediary_dir = self.config_manager.get_paths_config().get('intermediary_dir', 'output/intermediary')
+        output_dir = Path(intermediary_dir) / path
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if data_type in ['entities', 'wiki_info', 'embedding', 'analysis', 'additional_info']:
+                async with aiofiles.open(output_dir, 'w', encoding='utf-8', errors='replace') as f:
+                    await f.write(json.dumps(data, indent=2))
+                self.loggers['main'].debug(f"Saved {data_type} for '{path}'")
+            elif data_type == 'preprocessed_text':
+                async with aiofiles.open(output_dir, 'w', encoding='utf-8', errors='replace') as f:
+                    await f.write(data)
+                self.loggers['main'].debug(f"Saved preprocessed text for '{path}'")
+            else:
+                self.loggers['main'].warning(f"Unknown data_type '{data_type}' for saving intermediary data.")
+        except Exception as e:
+            self.loggers['errors'].error(f"Failed to save intermediary data to '{path}': {str(e)}")
+
+    def generate_entity_frequency_chart(self, entities: List[Dict[str, str]], story_id: str) -> Optional[str]:
         entity_counts = defaultdict(int)
         for entity in entities:
-            entity_counts[entity] += 1
-
+            entity_counts[entity['text']] += 1
         if not entity_counts:
             self.loggers['main'].warning(f"No entities found for story '{story_id}' to generate frequency chart.")
             return None
-
-        entities = list(entity_counts.keys())
+        entities_list = list(entity_counts.keys())
         counts = list(entity_counts.values())
-
         plt.figure(figsize=(10, 6))
-        plt.barh(entities, counts, color='skyblue')
+        plt.barh(entities_list, counts, color='skyblue')
         plt.xlabel('Frequency')
         plt.title('Entity Frequency')
         plt.tight_layout()
-
         visualizations_dir = self.config_manager.get_paths_config().get('visualizations_dir', 'output/visualizations')
         chart_filename = f"entity_frequency_{story_id}.png"
         chart_path = Path(visualizations_dir) / chart_filename
@@ -1010,28 +1059,60 @@ class StoryProcessor:
         self.loggers['main'].info(f"Entity frequency chart saved to {chart_path}")
         return str(chart_path)
 
+    def generate_entity_category_distribution_chart(self, processed_results: List[ProcessingResult], output_path: str) -> None:
+        entity_type_counts = defaultdict(int)
+        category_counts = defaultdict(int)
+        for result in processed_results:
+            if result.success and result.data:
+                wiki_info = result.data.get('wiki_info', {})
+                for entity, info in wiki_info.items():
+                    entity_type = info.get('type', 'OTHER').upper()
+                    if entity_type in ['PERSON', 'ORG', 'GPE', 'EVENT', 'PRODUCT']:
+                        entity_type_counts[entity_type] += 1
+                    else:
+                        entity_type_counts['OTHER'] += 1
+                    categories = info.get('categories', [])
+                    for category in categories:
+                        category_counts[category] += 1
+        if not entity_type_counts and not category_counts:
+            self.loggers['main'].warning("No entity types or categories found for distribution chart.")
+            return
+        # Plot Entity Types
+        if entity_type_counts:
+            labels = list(entity_type_counts.keys())
+            sizes = list(entity_type_counts.values())
+            fig = px.pie(names=labels, values=sizes, title='Entity Type Distribution', hole=0.3)
+            visualizations_dir = self.config_manager.get_paths_config().get('visualizations_dir', 'output/visualizations')
+            chart_path = Path(visualizations_dir) / f"entity_type_distribution_{output_path}.html"
+            chart_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.write_html(chart_path)
+            self.loggers['main'].info(f"Interactive entity type distribution chart saved to {chart_path}")
+        # Plot Top 10 Categories
+        if category_counts:
+            top_categories = dict(sorted(category_counts.items(), key=lambda item: item[1], reverse=True)[:10])
+            categories = list(top_categories.keys())
+            counts = list(top_categories.values())
+            fig = px.bar(x=categories, y=counts, labels={'x': 'Wikipedia Categories', 'y': 'Frequency'}, title='Top 10 Wikipedia Categories for Entities')
+            fig.update_layout(xaxis_tickangle=-45)
+            chart_path = Path(visualizations_dir) / f"entity_category_distribution_{output_path}.html"
+            fig.write_html(chart_path)
+            self.loggers['main'].info(f"Interactive entity category distribution chart saved to {chart_path}")
+
     def generate_word_cloud(self, processed_results: List[ProcessingResult], output_path: str) -> None:
-        """
-        Generate a word cloud from entity frequencies across all stories.
-        """
         entity_freq = defaultdict(int)
         for result in processed_results:
             if result.success and result.data:
                 entities = result.data.get('entities', [])
                 for entity in entities:
-                    entity_freq[entity] += 1
-
+                    entity_freq[entity['text']] += 1
         if not entity_freq:
             self.loggers['main'].warning("No entities found for word cloud generation.")
             return
-
         wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(entity_freq)
-
         plt.figure(figsize=(15, 7.5))
         plt.imshow(wordcloud, interpolation='bilinear')
         plt.axis('off')
         plt.tight_layout(pad=0)
-
         visualizations_dir = self.config_manager.get_paths_config().get('visualizations_dir', 'output/visualizations')
         chart_path = Path(visualizations_dir) / output_path
         chart_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1040,52 +1121,9 @@ class StoryProcessor:
         self.loggers['main'].info(f"Word cloud saved to {chart_path}")
 
     def generate_entity_distribution(self, processed_results: List[ProcessingResult], output_path: str) -> None:
-        """
-        Generate a pie chart showing the distribution of entity types.
-        """
-        entity_type_counts = defaultdict(int)
-        for result in processed_results:
-            if result.success and result.data:
-                wiki_info = result.data.get('wiki_info', {})
-                for entity, info in wiki_info.items():
-                    # Assuming 'summary' contains entity type information
-                    description = info.get('summary', '').upper()
-                    if 'PERSON' in description:
-                        entity_type_counts['PERSON'] += 1
-                    elif 'ORGANIZATION' in description or 'ORG' in description:
-                        entity_type_counts['ORG'] += 1
-                    elif 'LOCATION' in description or 'GPE' in description:
-                        entity_type_counts['GPE'] += 1
-                    elif 'EVENT' in description:
-                        entity_type_counts['EVENT'] += 1
-                    elif 'PRODUCT' in description:
-                        entity_type_counts['PRODUCT'] += 1
-                    else:
-                        entity_type_counts['OTHER'] += 1
-
-        if not entity_type_counts:
-            self.loggers['main'].warning("No entity types found for distribution chart.")
-            return
-
-        labels = list(entity_type_counts.keys())
-        sizes = list(entity_type_counts.values())
-
-        plt.figure(figsize=(8, 8))
-        plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140)
-        plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
-        plt.title('Entity Type Distribution')
-
-        visualizations_dir = self.config_manager.get_paths_config().get('visualizations_dir', 'output/visualizations')
-        chart_path = Path(visualizations_dir) / output_path
-        chart_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(chart_path)
-        plt.close()
-        self.loggers['main'].info(f"Entity type distribution chart saved to {chart_path}")
+        self.generate_entity_category_distribution_chart(processed_results, output_path)
 
     def generate_embeddings_tsne(self, processed_results: List[ProcessingResult], output_path: str) -> None:
-        """
-        Generate a t-SNE plot for story embeddings.
-        """
         embeddings = []
         labels = []
         for result in processed_results:
@@ -1094,26 +1132,29 @@ class StoryProcessor:
                 if embedding:
                     embeddings.append(embedding)
                     labels.append(result.data.get('story_id', 'Unknown'))
-
         if not embeddings:
             self.loggers['main'].warning("No embeddings found for t-SNE visualization.")
             return
-
         try:
-            tsne = TSNE(n_components=2, random_state=42, perplexity=5, n_iter=300)
-            embeddings_2d = tsne.fit_transform(embeddings)
-
+            embeddings_np = np.array(embeddings)  # Convert to NumPy array
+            n_samples = embeddings_np.shape[0]
+            if n_samples <= 1:
+                self.loggers['main'].warning("Not enough samples to generate t-SNE plot.")
+                return
+            perplexity = 30  # Default perplexity
+            if n_samples <= perplexity:
+                perplexity = max(5, n_samples - 1)  # Adjust perplexity to be less than n_samples
+                self.loggers['main'].info(f"Adjusted perplexity to {perplexity} based on number of samples: {n_samples}")
+            tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity, n_iter=300)
+            embeddings_2d = tsne.fit_transform(embeddings_np)
             plt.figure(figsize=(12, 8))
             plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], s=50, alpha=0.7)
-
             for i, label in enumerate(labels):
                 plt.annotate(label, (embeddings_2d[i, 0], embeddings_2d[i, 1]))
-
             plt.title('t-SNE Visualization of Story Embeddings')
             plt.xlabel('Dimension 1')
             plt.ylabel('Dimension 2')
             plt.tight_layout()
-
             visualizations_dir = self.config_manager.get_paths_config().get('visualizations_dir', 'output/visualizations')
             chart_path = Path(visualizations_dir) / output_path
             chart_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1124,27 +1165,21 @@ class StoryProcessor:
             self.loggers['errors'].error(f"Failed to generate t-SNE plot: {str(e)}")
 
     def generate_story_length_histogram(self, processed_results: List[ProcessingResult], output_path: str) -> None:
-        """
-        Generate a histogram of story lengths.
-        """
         story_lengths = []
         for result in processed_results:
             if result.success and result.data:
                 analysis = result.data.get('analysis', '')
                 word_count = len(analysis.split())
                 story_lengths.append(word_count)
-
         if not story_lengths:
             self.loggers['main'].warning("No story lengths found for histogram.")
             return
-
         plt.figure(figsize=(10, 6))
         plt.hist(story_lengths, bins=10, color='skyblue', edgecolor='black')
         plt.xlabel('Number of Words')
         plt.ylabel('Number of Stories')
         plt.title('Distribution of Story Lengths')
         plt.tight_layout()
-
         visualizations_dir = self.config_manager.get_paths_config().get('visualizations_dir', 'output/visualizations')
         chart_path = Path(visualizations_dir) / output_path
         chart_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1152,45 +1187,19 @@ class StoryProcessor:
         plt.close()
         self.loggers['main'].info(f"Story length distribution histogram saved to {chart_path}")
 
-    def _save_intermediary_data(self, data: Any, path: str, data_type: str) -> None:
-        """
-        Save intermediary data to the specified path.
-        Supports JSON and TXT formats based on data_type.
-        """
-        intermediary_dir = self.config_manager.get_paths_config().get('intermediary_dir', 'output/intermediary')
-        output_dir = Path(intermediary_dir) / path
-        output_dir.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            if data_type in ['entities', 'wiki_info', 'embedding', 'analysis', 'additional_info']:
-                with open(output_dir, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
-                self.loggers['main'].debug(f"Saved {data_type} for '{path}'")
-            elif data_type == 'preprocessed_text':
-                with open(output_dir, 'w', encoding='utf-8') as f:
-                    f.write(data)
-                self.loggers['main'].debug(f"Saved preprocessed text for '{path}'")
-            else:
-                self.loggers['main'].warning(f"Unknown data_type '{data_type}' for saving intermediary data.")
-        except Exception as e:
-            self.loggers['errors'].error(f"Failed to save intermediary data to '{path}': {str(e)}")
-
     def _retrieve_all_reports_sync(self, collection_name: str) -> List[str]:
         try:
             all_reports = []
-            limit = self.config_manager.config.get('qdrant', {}).get('settings', {}).get('retrieve_limit', 100)
-
+            limit = self.config_manager.config.get('qdrant', {}).get('settings', {}).get('retrieve_limit', 1000)
             scroll_result = self.qdrant_client.scroll(
                 collection_name=collection_name,
                 limit=limit,
                 with_payload=True,
                 with_vectors=False
             )
-
             if scroll_result is None:
                 self.loggers['main'].warning(f"No data returned from '{collection_name}' collection.")
                 return all_reports
-
             for batch in scroll_result:
                 if not batch:
                     break
@@ -1201,40 +1210,43 @@ class StoryProcessor:
                             all_reports.append(content)
                     else:
                         self.loggers['errors'].warning(f"Unexpected record type or missing payload: {record}")
-
             self.loggers['main'].info(f"Retrieved {len(all_reports)} reports from '{collection_name}' collection.")
             return all_reports
         except Exception as e:
             self.loggers['errors'].error(f"Failed to retrieve reports from '{collection_name}' collection: {str(e)}")
             return []
 
-
     async def _retrieve_all_reports_async(self, collection_name: str) -> List[str]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._retrieve_all_reports_sync, collection_name)
 
-    # ------------------------------
-    # Worker Functions
-    # ------------------------------
+    async def generate_summary_report(self, summary_output_path: str) -> None:
+        all_reports = await self._retrieve_all_reports_async(self.reports_collection_name)
+        if not all_reports:
+            self.loggers['main'].warning("No reports found in the reports collection to generate a summary.")
+            summary = "No reports available to generate a summary."
+        else:
+            self.loggers['llm'].debug("Generating summary from all stored reports")
+            summary = await self.report_post_processor.generate_summary(all_reports)
+        await self._save_report_async(summary, summary_output_path)
+
+    def _generate_report(self, results: List[ProcessingResult]) -> str:
+        # This method is deprecated in favor of process_full_report
+        return ""
+
+# Global workers
 _worker_nlp = None
 _worker_spell_checker = None
 
 def initialize_worker():
-    """
-    Initialize resources for worker processes.
-    This function is called once per worker process.
-    """
     global _worker_nlp
     global _worker_spell_checker
-    _worker_nlp = spacy.load("en_core_web_sm")  # Use a lightweight model for efficiency
-    _worker_spell_checker = SpellChecker()
+    if _worker_nlp is None:
+        _worker_nlp = spacy.load("en_core_web_sm")
+    if _worker_spell_checker is None:
+        _worker_spell_checker = SpellChecker()
 
 def preprocess_text_worker(text: str) -> str:
-    """
-    Worker function to preprocess text:
-    - Spell checking
-    - Tokenization
-    """
     global _worker_nlp
     global _worker_spell_checker
     if _worker_nlp is None or _worker_spell_checker is None:
@@ -1245,76 +1257,58 @@ def preprocess_text_worker(text: str) -> str:
         if token.is_alpha and not token.ent_type_:
             corrected_word = _worker_spell_checker.correction(token.text)
             if corrected_word is None:
-                logging.getLogger('main').debug(f"SpellChecker returned None for token '{token.text}' in text: {text[:30]}...")
                 corrected_word = token.text
             corrected_tokens.append(corrected_word)
         else:
             token_text = token.text if token.text is not None else ""
-            if token.text is None:
-                logging.getLogger('main').debug(f"Token.text is None at index {idx} in text: {text[:30]}...")
             corrected_tokens.append(token_text)
     corrected_text = ' '.join(corrected_tokens)
     return corrected_text
 
-def extract_and_resolve_entities_worker(text: str) -> List[str]:
-    """
-    Worker function to extract and resolve entities.
-    """
+def extract_and_resolve_entities_worker(text: str) -> List[Dict[str, str]]:
     global _worker_nlp
     if _worker_nlp is None:
         initialize_worker()
     relevant_entity_types = {'PERSON', 'ORG', 'GPE', 'EVENT', 'PRODUCT'}
     doc = _worker_nlp(text)
     entities = list(set([ent.text for ent in doc.ents if ent.label_ in relevant_entity_types]))
-    # Resolve entities by choosing the longest name in each group
     entity_groups = defaultdict(list)
     for entity in entities:
         key = ''.join(e.lower() for e in entity if e.isalnum())
         entity_groups[key].append(entity)
-    resolved_entities = [max(group, key=len) for group in entity_groups.values()]
-    # Ensure all entities are strings
-    resolved_entities = [entity if entity is not None else "" for entity in resolved_entities]
+    resolved_entities = []
+    for group in entity_groups.values():
+        primary_entity = max(group, key=len)
+        doc_primary = _worker_nlp(primary_entity)
+        if doc_primary.ents:
+            entity_type = doc_primary.ents[0].label_
+        else:
+            entity_type = 'UNKNOWN'  # Set to 'UNKNOWN' if no entity type found
+        resolved_entities.append({"text": primary_entity, "type": entity_type})
     return resolved_entities
 
-# ------------------------------
-# Main Function
-# ------------------------------
+# Main Execution Function
 async def main():
     try:
-        # Initialize ConfigManager
         config_manager = ConfigManager()
-
-        # Initialize LoggerFactory
         logger_factory = LoggerFactory(config_manager)
         loggers = logger_factory.loggers
-
-        # Initialize StoryProcessor
         processor = StoryProcessor(config_manager, loggers)
         processor.initialize()
-
-        # Get Paths Configuration
         paths_config = config_manager.get_paths_config()
-
-        # Start Processing Stories
         await processor.process_stories_async(
             stories_dir=paths_config.get('stories_dir', 'stories'),
             output_path=paths_config.get('output_report_path', 'output/report.md'),
             summary_output_path=paths_config.get('summary_output_path', 'output/summary_report.md')
         )
     except Exception as e:
-        # In case loggers are not initialized
         root_logger = logging.getLogger('errors')
         root_logger.error(f"Application error: {str(e)}", exc_info=True)
         raise
 
-# ------------------------------
-# Entry Point
-# ------------------------------
 if __name__ == "__main__":
-    # Use 'spawn' start method for compatibility, especially on Windows
     try:
         multiprocessing.set_start_method('spawn')
     except RuntimeError:
-        # The start method has already been set; ignore the error
         pass
     asyncio.run(main())

@@ -4,11 +4,12 @@
 openai:
   settings:
     api_key: "your_openai_api_key_here"  # Replace with your actual OpenAI API key
-    embedding_model: "text-embedding-3-small"  # Updated embedding model
-    chat_model: "gpt-4o"  # Updated to a high-capacity model
+    embedding_model: "text-embedding-ada-002"  # Updated embedding model
+    chat_model: "gpt-4"  # Corrected model name to 'gpt-4'
     timeout: 60.0  # Increased timeout to handle longer processing
     max_tokens: 10000  # Adjusted max_tokens to align with standard context length
-    temperature: 1.0  # Higher temperature for more creative outputs
+    temperature: 0.7  # Adjusted temperature for balanced creativity and coherence
+    context_length: 8192  # Added context_length for token calculations
 
 # Qdrant Configuration
 qdrant:
@@ -31,75 +32,140 @@ prompts:
     system: |
       You are an expert AI assistant specializing in news analysis and report refinement. Your task is to enhance reports by integrating relevant Wikipedia information and providing comprehensive context.
     user: |
-      Your goal is to refine and improve a generated report about a news story by effectively utilizing the provided Wikipedia information to add context and depth.
-      
+      Your objective is to refine and elevate a generated report about a news story by meticulously utilizing the provided Wikipedia information to add significant context, depth, and clarity.
+  
       **Original Story:**
       {original_story}
-      
+  
       **Generated Report:**
       {generated_report}
-      
+  
       **Wikipedia Information:**
       {wikipedia_info}
-      
-      Please perform the following tasks:
-      
-      1. **Integrate Wikipedia Information:**  
-         - Seamlessly incorporate the relevant Wikipedia information into the generated report.
-         - Ensure that the added content enhances the understanding of the story by providing:
-           - Historical background of locations or organizations mentioned.
-           - Explanations of technical terms or concepts.
-           - Relevant past events or trends related to the current story.
-           - Biographical information about key figures, if applicable.
-      
-      2. **Enhance Clarity and Coherence:**  
-         - Improve the overall flow and readability of the report.
-         - Ensure that the integration of additional information does not disrupt the narrative but instead enhances it.
-      
-      3. **Fact-Check and Correct Inaccuracies:**  
-         - Cross-reference the original report with the Wikipedia information to identify and correct any inaccuracies or misinterpretations.
-      
-      4. **Ensure Relevance of Entities:**  
-         - Verify that all entities mentioned in the report are directly related to the story.
-         - Remove or minimize references to entities that do not contribute to the core narrative or analysis.
-      
-      5. **Explain Decision-Making Process:**  
-         - For each significant addition or modification, provide a brief explanation of why it was included and how it enhances the report.
-         - Detail the rationale behind the selection of specific Wikipedia information to integrate.
-      
-      6. **Provide Annotations:**  
-         - After each section or paragraph, include an annotation explaining the reason for its inclusion and how it relates to the overall analysis.
-      
-      7. **Highlight Reasoning Chains:**  
-         - Clearly indicate how conclusions about various entities were derived from the integrated information.
-         - Trace the logical flow from the original story to the refined analysis.
-      
-      8. **Summarize Integrated Information:**  
-         - At the end of the report, provide a concise summary of all the integrated Wikipedia articles.
-         - Highlight the key points from each article that were utilized in enhancing the report.
-      
+  
+      **Wikipedia Sections:**
+      {wikipedia_sections}
+  
+      **Tasks to Perform:**
+  
+      1. **Comprehensive Integration of Wikipedia Information:**  
+         - Seamlessly incorporate the provided Wikipedia data into the generated report.
+         - Utilize both the summary and specific sections to enhance the report by adding:
+           - **Historical Context:** Background details about locations, organizations, and events mentioned.
+           - **Technical Explanations:** Clarifications of any technical terms, concepts, or jargon to ensure reader comprehension.
+           - **Biographical Insights:** Detailed information about key individuals involved, including their roles and significance.
+           - **Relevant Past Events:** Information on similar or related past events that provide a deeper understanding of the current story.
+           - **Statistical Data:** Incorporate relevant statistics or figures from Wikipedia to support analysis.
+  
+      2. **Enhancement of Clarity and Coherence:**  
+         - Refine the narrative flow to ensure logical progression of ideas.
+         - Improve sentence structure and word choice for better readability.
+         - Ensure that the integration of new information does not disrupt the original narrative but instead complements it.
+  
+      3. **Rigorous Fact-Checking and Correction of Inaccuracies:**  
+         - Cross-verify facts in the generated report with the provided Wikipedia information.
+         - Identify and correct any discrepancies, errors, or misinterpretations.
+         - Highlight corrections made to ensure transparency and accuracy.
+  
+      4. **Verification and Relevance of Entities:**  
+         - Ensure that all entities mentioned are pertinent to the story's core narrative.
+         - Remove or minimize references to entities that do not add value or clarity to the analysis.
+         - Validate the accuracy of entity names and affiliations.
+  
+      5. **Detailed Explanation of Refinement Decisions:**  
+         - For every significant addition or modification, provide a concise explanation of its purpose.
+         - Explain how each change enhances the report's overall quality and informativeness.
+         - Outline the rationale behind selecting specific Wikipedia information for integration.
+  
+      6. **Inclusion of Annotations:**  
+         - After each major section or paragraph, include annotations that explain:
+           - The reason for including specific information.
+           - How it relates to the overall analysis and narrative.
+           - Any sources or references used to support the added content.
+  
+      7. **Highlighting Reasoning Chains:**  
+         - Clearly delineate the logical flow from the original story to the refined analysis.
+         - Trace how conclusions about various entities and events are derived from the integrated information.
+         - Ensure that the reasoning is transparent and easy to follow for the reader.
+  
+      8. **Comprehensive Summary of Integrated Information:**  
+         - At the end of the report, provide a succinct summary of all integrated Wikipedia articles.
+         - Highlight key points from each article that were instrumental in enhancing the analysis.
+         - Ensure that the summary encapsulates the essence of the added information.
+  
+      9. **Expansion on Key Points and Themes:**  
+         - Elaborate on significant themes, findings, and insights to provide a deeper understanding.
+         - Incorporate relevant quotes, data, or additional sources from Wikipedia to bolster the analysis.
+         - Discuss the implications of these key points in the context of the news story.
+  
+      10. **Ensuring Comprehensive and Balanced Coverage:**  
+          - Verify that all critical aspects of the original story are addressed and enriched.
+          - Avoid overlooking any vital information that could provide additional insights or clarity.
+          - Strive for a balanced representation of information to maintain objectivity and thoroughness.
+  
+      11. **Inclusion of Citations and References:**  
+          - For every piece of information integrated from Wikipedia, include a citation.
+          - Use the format `[Wikipedia](<URL>)` immediately after the relevant content.
+          - Ensure that all citations are accurate and correspond to the correct Wikipedia pages.
+  
       **Deliverable:**  
-      Provide a refined version of the report that incorporates the above enhancements, effectively utilizing Wikipedia information to create a more informative and contextually rich analysis. Additionally, include explanations of the decisions made during the refinement process to understand how conclusions about various entities were reached.
+      Produce a meticulously refined version of the report that integrates the specified Wikipedia information to create a more informative, contextually rich, and analytically robust analysis. Additionally, include detailed explanations of the decisions made during the refinement process to elucidate how conclusions about various entities and events were reached. Ensure that all integrated information from Wikipedia is properly cited with accurate references.
   
   summary_generation:
     system: |
-      You are an expert AI assistant specializing in summarizing multiple reports into a cohesive summary. Your task is to distill the essential points from each report to create a comprehensive and concise summary.
+      You are an expert AI assistant specializing in synthesizing multiple reports into a cohesive, comprehensive, and insightful summary. Your role is to distill essential points from each report to create a detailed and informative overview.
     user: |
-      Please create a comprehensive summary based on the following refined reports:
+      Please generate a comprehensive and in-depth summary based on the following refined reports:
       
       {reports}
       
-      Ensure that the summary:
-      
-      - Captures the key insights and findings from each individual report.
-      - Highlights common themes, trends, and significant points across all reports.
-      - Maintains clarity and coherence, providing a clear overview without unnecessary detail.
-      - Reflects the enhanced context and information derived from Wikipedia integrations in the individual reports.
-      - Explains the reasoning behind the identification of key themes and trends.
-      
-      **Deliverable:**  
-      Provide a concise and informative summary that encapsulates the key points from all the refined reports, offering a comprehensive overview of the analyzed stories. Additionally, include explanations of how common themes and trends were identified based on the individual analyses.
+      **Requirements for the Summary:**
   
+      - **Extraction of Key Insights and Findings:**  
+        - Identify and extract the most significant points from each individual report.
+        - Highlight unique contributions, standout observations, and critical analyses presented in each report.
+  
+      - **Identification and Elaboration of Common Themes, Trends, and Significant Points:**  
+        - Detect recurring themes, patterns, and trends across all reports.
+        - Analyze these themes to understand their implications and significance in the broader context of the subject matter.
+  
+      - **Maintenance of Clarity, Coherence, and Logical Flow:**  
+        - Organize information in a well-structured manner to ensure logical progression of ideas.
+        - Utilize clear and precise language to convey complex concepts effectively.
+        - Ensure that the summary is easily understandable and engaging for the reader.
+  
+      - **Incorporation of Enhanced Context and Information:**  
+        - Leverage the additional context provided by Wikipedia integrations in the individual reports.
+        - Integrate this context to enrich the summary, providing a more nuanced and comprehensive understanding.
+  
+      - **Explanation of Reasoning Behind Identification of Key Themes and Trends:**  
+        - Detail the analytical processes used to synthesize information from multiple reports.
+        - Explain how key themes and trends were identified and the rationale behind their selection.
+  
+      - **Fact-Checking and Verification of Information:**  
+        - Rigorously verify the accuracy of information presented in the reports.
+        - Correct any discrepancies, errors, or inconsistencies to ensure the reliability of the summary.
+  
+      - **Incorporation of Statistical Data, Quotes, and Additional Sources:**  
+        - Include relevant statistics, direct quotes, and references from credible sources to support the summary.
+        - Ensure that all data and quotes are accurately represented and appropriately cited.
+  
+      - **Comprehensive Coverage of Significant Aspects:**  
+        - Ensure that all major points, findings, and analyses from the reports are addressed.
+        - Avoid omissions that could lead to an incomplete or skewed understanding of the subject matter.
+  
+      - **Provision of Analytical Insights:**  
+        - Go beyond mere summarization by offering analytical perspectives on the collected data.
+        - Discuss potential implications, future trends, and areas for further investigation based on the synthesized information.
+  
+      - **Extraction and Detailed Explanation of Entities:**  
+        - Extract all entities mentioned across the reports and display them in the final summary.
+        - Provide detailed explanations of how each entity was identified, including any corrections or standardizations of their names.
+        - Ensure that no entity is left unexplained or omitted, allowing for comprehensive review and verification of facts discovered through the articles and Wikipedia.
+  
+      **Deliverable:**  
+      Provide a detailed and insightful summary that encapsulates all key points from the refined reports, offering a comprehensive overview of the analyzed stories. Additionally, include thorough explanations of how common themes and trends were identified based on the individual analyses, ensuring all information is fact-checked for accuracy and reliability.
+
   entity_suggestion:
     system: |
       You are an assistant that suggests alternative names for entities.
@@ -139,6 +205,8 @@ retry:
 # Aiohttp Configuration
 aiohttp:
   timeout: 60  # Increased timeout to handle longer requests
+  max_connections: 10  # Limit to 10 concurrent connections to Wikipedia API
+  rate_limit: 5  # Max 5 requests per second
 
 # Process Pool Configuration
 process_pool:
