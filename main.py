@@ -1,23 +1,9 @@
 import logging
 import asyncio
-from typing import Dict, List, Any
-from bs4 import BeautifulSoup
 import multiprocessing
-import warnings
-from bs4 import GuessedAtParserWarning
 from app.config_manager import ConfigManager
 from app.logging_setup import LoggerFactory
 from app.story_processor import StoryProcessor
-# Suppress specific warnings
-warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
-
-# Patch BeautifulSoup to use 'html.parser' by default
-original_bs_constructor = BeautifulSoup
-
-def patched_bs_constructor(html, *args, **kwargs):
-    return original_bs_constructor(html, features="html.parser", *args, **kwargs)
-
-BeautifulSoup = patched_bs_constructor
 
 # Main Execution Function
 async def main():
