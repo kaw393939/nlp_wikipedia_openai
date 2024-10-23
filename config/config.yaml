@@ -114,7 +114,7 @@ analysis:
 # OpenAI Configuration
 openai:
   settings:
-    api_key: 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
+    api_key: 
     temperature: 0.7  # Default temperature for OpenAI completions
     chat_model: "gpt-4o"  # Chat model to use
     embedding_model: "text-embedding-3-small"  # Embedding model to use
