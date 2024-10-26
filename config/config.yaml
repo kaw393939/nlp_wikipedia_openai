@@ -1,4 +1,4 @@
-# Configuration file for Story Processor Application with Enhanced Design and Logging
+# config/config.yaml
 
 # Prompts Configuration
 prompts:
@@ -114,7 +114,7 @@ analysis:
 # OpenAI Configuration
 openai:
   settings:
-    api_key: 
+    # Removed api_key to use environment variable instead
     temperature: 0.7  # Default temperature for OpenAI completions
     chat_model: "gpt-4o"  # Chat model to use
     embedding_model: "text-embedding-3-small"  # Embedding model to use
@@ -125,7 +125,7 @@ openai:
 # Qdrant Configuration
 qdrant:
   url: "http://localhost:6333"  # Qdrant server URL
-  api_key: "your_qdrant_api_key_here"  # Replace with your actual Qdrant API key
+  api_key: "${QDRANT_API_KEY}"  # Reference to environment variable
   stories_collection: "stories_collection411"  # Collection name for stories
   reports_collection: "reports_collection411"  # Collection name for reports
   vector_size: 1536  # Size of the embedding vectors

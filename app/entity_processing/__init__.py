@@ -26,6 +26,8 @@ from rapidfuzz import process, fuzz
 from metaphone import doublemetaphone
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from langdetect import detect
+import yake  # Updated import for keyword extraction
 
 from app import retry_async  # Custom retry decorator
 from app.config_manager import ConfigManager  # Configuration manager
@@ -120,8 +122,8 @@ class EnhancedEntityProcessor:
             self.openai_client, self.config_manager, self.loggers
         )
 
-        # Initialize Process Pool Executor
-        self.process_pool = asyncio.get_event_loop().run_in_executor
+        # Initialize stories dictionary
+        self.stories: Dict[str, str] = {}
 
     async def __aenter__(self):
         """
@@ -139,7 +141,9 @@ class EnhancedEntityProcessor:
         """
         Close the aiohttp ClientSession to free up resources.
         """
-        await self.session.close()
+        if not self.session.closed:
+            await self.session.close()
+            self.logger.info("aiohttp session closed.")
 
     @retry
     async def correct_entity_spelling(self, entity: str, context: str) -> Optional[str]:
@@ -748,6 +752,206 @@ class EnhancedEntityProcessor:
             None, self._store_points_in_qdrant_sync, collection_name, points
         )
 
+    async def perform_sentiment_analysis(self, text: str) -> str:
+        """
+        Perform sentiment analysis on the given text.
+
+        Args:
+            text (str): The text to analyze.
+
+        Returns:
+            str: The sentiment result ('positive', 'negative', or 'neutral').
+        """
+        prompt = f"Analyze the sentiment of the following text and respond with 'positive', 'negative', or 'neutral':\n\n{text}"
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                messages=messages,
+                max_tokens=1,
+                temperature=0.0,
+            )
+            sentiment = response.choices[0].message.content.strip().lower()
+            if sentiment in ['positive', 'negative', 'neutral']:
+                return sentiment
+            else:
+                self.loggers["llm"].warning(f"Unexpected sentiment result: {sentiment}")
+                return "unknown"
+        except Exception as e:
+            self.loggers["errors"].error(f"Sentiment analysis failed: {str(e)}")
+            return "unknown"
+
+    async def extract_concepts(self, text: str) -> List[str]:
+        """
+        Extract key concepts from the text.
+
+        Args:
+            text (str): The text to analyze.
+
+        Returns:
+            List[str]: A list of extracted concepts.
+        """
+        prompt = f"Identify the key concepts in the following text:\n\n{text}\n\nConcepts:"
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                messages=messages,
+                max_tokens=50,
+                temperature=0.5,
+            )
+            concepts = response.choices[0].message.content.strip()
+            concepts_list = [concept.strip() for concept in concepts.split(',') if concept.strip()]
+            return concepts_list
+        except Exception as e:
+            self.loggers["errors"].error(f"Concept extraction failed: {str(e)}")
+            return []
+
+    async def perform_entity_sentiment_analysis(self, entity: str, context: str) -> str:
+        """
+        Analyze the sentiment associated with a specific entity within the context.
+
+        Args:
+            entity (str): The entity to analyze.
+            context (str): The full text context.
+
+        Returns:
+            str: The sentiment result ('positive', 'negative', or 'neutral').
+        """
+        prompt = f"In the following text, what is the sentiment towards '{entity}'? Respond with 'positive', 'negative', or 'neutral':\n\n{context}"
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                messages=messages,
+                max_tokens=1,
+                temperature=0.0,
+            )
+            sentiment = response.choices[0].message.content.strip().lower()
+            if sentiment in ['positive', 'negative', 'neutral']:
+                return sentiment
+            else:
+                self.loggers["llm"].warning(f"Unexpected entity sentiment result for '{entity}': {sentiment}")
+                return "unknown"
+        except Exception as e:
+            self.loggers["errors"].error(f"Entity sentiment analysis failed for '{entity}': {str(e)}")
+            return "unknown"
+
+    async def extract_entity_relations(self, entities: List[str], text: str) -> Any:
+        """
+        Extract relationships between entities in the text.
+
+        Args:
+            entities (List[str]): A list of entity names.
+            text (str): The text to analyze.
+
+        Returns:
+            Any: The extracted relationships.
+        """
+        prompt = f"Extract relationships between the following entities in the text: {', '.join(entities)}.\n\nText:\n{text}\n\nList the relationships:"
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                messages=messages,
+                max_tokens=150,
+                temperature=0.5,
+            )
+            relations_text = response.choices[0].message.content.strip()
+            return relations_text
+        except Exception as e:
+            self.loggers["errors"].error(f"Relation extraction failed: {str(e)}")
+            return []
+
+    async def perform_emotion_analysis(self, text: str) -> List[str]:
+        """
+        Analyze the emotions expressed in the text.
+
+        Args:
+            text (str): The text to analyze.
+
+        Returns:
+            List[str]: A list of detected emotions.
+        """
+        prompt = f"Identify the emotions expressed in the following text:\n\n{text}\n\nEmotions:"
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                messages=messages,
+                max_tokens=50,
+                temperature=0.5,
+            )
+            emotions = response.choices[0].message.content.strip()
+            emotions_list = [emotion.strip() for emotion in emotions.split(',') if emotion.strip()]
+            return emotions_list
+        except Exception as e:
+            self.loggers["errors"].error(f"Emotion analysis failed: {str(e)}")
+            return []
+
+    def extract_keywords(self, text: str) -> List[str]:
+        """
+        Extract keywords from the text.
+
+        Args:
+            text (str): The text to analyze.
+
+        Returns:
+            List[str]: A list of extracted keywords.
+        """
+        try:
+            kw_extractor = yake.KeywordExtractor(lan='en', n=1, top=10)
+            keywords = kw_extractor.extract_keywords(text)
+            keywords_list = [kw[0] for kw in keywords]
+            return keywords_list
+        except Exception as e:
+            self.loggers["errors"].error(f"Keyword extraction failed: {str(e)}")
+            return []
+
+    def detect_language(self, text: str) -> str:
+        """
+        Detect the language of the given text.
+
+        Args:
+            text (str): The text to analyze.
+
+        Returns:
+            str: The ISO 639-1 code of the detected language.
+        """
+        try:
+            language = detect(text)
+            return language
+        except Exception as e:
+            self.loggers["errors"].error(f"Language detection failed: {str(e)}")
+            return "unknown"
+
+    async def translate_text(self, text: str, target_lang: str = 'en') -> str:
+        """
+        Translate the given text to the target language.
+
+        Args:
+            text (str): The text to translate.
+            target_lang (str): The target language code.
+
+        Returns:
+            str: The translated text.
+        """
+        # Placeholder for actual translation logic
+        # You can integrate with a translation API like Google Translate or DeepL
+        self.loggers["main"].info("Translation functionality not implemented. Returning original text.")
+        return text  # Assuming text is already in English or translation is not implemented
+
+    def generate_knowledge_graph(self, entities: List[Dict[str, str]], relations: Any) -> None:
+        """
+        Generate a knowledge graph from entities and their relationships.
+
+        Args:
+            entities (List[Dict[str, str]]): List of entity dictionaries.
+            relations (Any): The relationships between entities.
+        """
+        # Placeholder for actual knowledge graph generation logic
+        self.loggers["main"].info("Knowledge graph generation not implemented.")
+
     @retry_async()
     async def process_story_async(
         self, story_id: str, content: str
@@ -764,9 +968,16 @@ class EnhancedEntityProcessor:
             ProcessingResult: Result of the processing, indicating success or failure.
         """
         try:
+            # Language detection and translation
+            language = self.detect_language(content)
+            if language != 'en':
+                corrected_content = await self.translate_text(content)
+            else:
+                corrected_content = content
+
             self.loggers["main"].debug(f"Starting preprocessing for story '{story_id}'")
             corrected_content = await asyncio.get_running_loop().run_in_executor(
-                None, preprocess_text_worker, content
+                None, preprocess_text_worker, corrected_content
             )
             self.loggers["main"].debug(
                 f"Preprocessing completed for story '{story_id}'"
@@ -778,6 +989,20 @@ class EnhancedEntityProcessor:
                 f"Entities extracted for story '{story_id}': {resolved_entities}"
             )
             wiki_info = await self.get_entities_info(resolved_entities, corrected_content)
+
+            # Perform additional analyses
+            sentiment = await self.perform_sentiment_analysis(corrected_content)
+            concepts = await self.extract_concepts(corrected_content)
+            emotions = await self.perform_emotion_analysis(corrected_content)
+            keywords = self.extract_keywords(corrected_content)
+            relations = await self.extract_entity_relations(
+                [entity['text'] for entity in resolved_entities], corrected_content
+            )
+            summary = await self._summarize_text(corrected_content)
+
+            # Generate knowledge graph (placeholder)
+            self.generate_knowledge_graph(resolved_entities, relations)
+
             self.loggers["llm"].debug(f"Generating embedding for story '{story_id}'")
             embedding = await self._get_embedding_async(corrected_content)
             self.loggers["llm"].debug(f"Embedding generated for story '{story_id}'")
@@ -814,10 +1039,17 @@ class EnhancedEntityProcessor:
             # Removed visualization generation
             result = {
                 "story_id": story_id,
+                "language": language,
                 "entities": resolved_entities,
                 "wiki_info": wiki_info,
                 "analysis": analysis,
                 "embedding": embedding,
+                "sentiment": sentiment,
+                "concepts": concepts,
+                "emotions": emotions,
+                "keywords": keywords,
+                "relations": relations,
+                "summary": summary,
                 "timestamp": datetime.now().isoformat(),
                 # "entity_frequency_chart": chart_path  # Removed
             }
@@ -1145,25 +1377,34 @@ class EnhancedEntityProcessor:
         await self._save_report_async(summary, summary_output_path)
 
     async def get_entities_info(
-        self, entities: List[str], context: str
+        self, entities: List[Dict[str, str]], context: str
     ) -> Dict[str, Any]:
         """
         Retrieve comprehensive information about a list of entities.
 
         Args:
-            entities (List[str]): List of entity names to retrieve information for.
+            entities (List[Dict[str, str]]): List of entity dictionaries containing 'text' and 'type' for each entity.
             context (str): Contextual information for processing.
 
         Returns:
             Dict[str, Any]: Dictionary containing information about each entity.
         """
         wiki_info = {}
-        for entity in entities:
-            info = await self.get_entity_info_single(entity, context)
-            if info:
-                wiki_info[entity] = info
+        for entity_dict in entities:
+            # Extract the 'text' field from the entity dictionary
+            entity = entity_dict.get('text', None)
+            if entity:
+                info = await self.get_entity_info_single(entity, context)
+                if info:
+                    # Perform entity-level sentiment analysis
+                    entity_sentiment = await self.perform_entity_sentiment_analysis(entity, context)
+                    info['sentiment'] = entity_sentiment
+                    wiki_info[entity] = info  # Only store 'text' as the key, not the entire dict
+            else:
+                self.loggers['wikipedia'].error(f"Entity dictionary missing 'text' field: {entity_dict}")
         return wiki_info
 
+    @retry
     async def get_entity_info_single(
         self, entity: str, context: str
     ) -> Optional[Dict[str, Any]]:
@@ -1229,16 +1470,11 @@ class EnhancedEntityProcessor:
                             async with self.session.get(summary_api_url) as summary_resp:
                                 if summary_resp.status == 200:
                                     summary_data = await summary_resp.json()
-                                    # Check if the page is a disambiguation page
-                                    categories = [
-                                        cat.get("title", "").lower()
-                                        for cat in summary_data.get("categories", [])
-                                    ]
-                                    if "disambiguation" in categories:
+                                    if summary_data.get("type") == "disambiguation":
+                                        # Handle disambiguation page
                                         self.loggers["wikipedia"].warning(
                                             f"Entity '{entity}' leads to a disambiguation page."
                                         )
-                                        # Suggest an alternative entity name to resolve ambiguity
                                         alternative_entity = await self.suggest_alternative_entity_name(
                                             entity, context
                                         )
@@ -1257,29 +1493,24 @@ class EnhancedEntityProcessor:
                                             return None
 
                                     # Construct the information dictionary with summary details
+                                    aliases = []
+                                    for lang_aliases in entity_data.get("aliases", {}).values():
+                                        aliases.extend(alias.get("value") for alias in lang_aliases)
+                                    aliases = list(set(aliases))
+
                                     info = {
                                         "wikidata_id": wikidata_id,
                                         "title": summary_data.get("title", "No title available"),
                                         "summary": summary_data.get("extract", "No summary available"),
                                         "url": summary_data.get("content_urls", {}).get("desktop", {}).get("page", "#"),
-                                        "categories": [
-                                            cat.get("title", "") for cat in summary_data.get("categories", [])
-                                        ][:5],
+                                        "categories": [],  # Categories are not available in summary_data
                                         "type": summary_data.get("type", "UNKNOWN"),
-                                        "aliases": [
-                                            alias.get("value") for alias in entity_data.get("aliases", {}).get("en", [])
-                                        ],
+                                        "aliases": aliases if aliases else [entity],
                                     }
 
                                     # Fetch and add specific sections from the Wikipedia page
                                     sections = await self.get_entity_sections(wikipedia_title)
                                     info.update({"sections": sections})
-
-                                    # Enhanced Entity Resolution: Ensure aliases include the original entity to prevent misspellings
-                                    if not info["aliases"]:
-                                        info["aliases"] = [entity]
-                                    else:
-                                        info["aliases"] = list(set(info["aliases"] + [entity]))
 
                                     # Cache the complete information to avoid future redundant API calls
                                     self.wikipedia_cache[entity] = info
@@ -1314,32 +1545,19 @@ class EnhancedEntityProcessor:
                                         f"Wikipedia summary request failed for '{wikipedia_title}' with status code {summary_resp.status}"
                                     )
                                     return None
+                    elif resp.status == 404:
+                        self.loggers["wikipedia"].warning(
+                            f"Wikidata entity not found for '{entity}'."
+                        )
+                        return None
+                    else:
+                        self.loggers["wikipedia"].error(
+                            f"Wikidata entity request failed for '{entity}' with status code {resp.status}"
+                        )
+                        return None
         except Exception as e:
             # Log any exceptions that occur during the entire entity information retrieval process
             self.loggers["wikipedia"].error(
                 f"Exception during Wikipedia request for '{entity}': {e}"
             )
             return None
-
-    async def get_entities_info(self, entities: List[Dict[str, str]], context: str) -> Dict[str, Any]:
-        """
-        Retrieve comprehensive information about a list of entities.
-
-        Args:
-            entities (List[Dict[str, str]]): List of entity dictionaries containing 'text' and 'type' for each entity.
-            context (str): Contextual information for processing.
-
-        Returns:
-            Dict[str, Any]: Dictionary containing information about each entity.
-        """
-        wiki_info = {}
-        for entity_dict in entities:
-            # Extract the 'text' field from the entity dictionary
-            entity = entity_dict.get('text', None)
-            if entity:
-                info = await self.get_entity_info_single(entity, context)
-                if info:
-                    wiki_info[entity] = info  # Only store 'text' as the key, not the entire dict
-            else:
-                self.loggers['wikipedia'].error(f"Entity dictionary missing 'text' field: {entity_dict}")
-        return wiki_info
