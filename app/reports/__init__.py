@@ -11,14 +11,12 @@ import spacy
 import wikipedia
 from aiolimiter import AsyncLimiter
 from bs4 import GuessedAtParserWarning
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openai import AsyncOpenAI
 
 from app.config_manager import ConfigManager
 from app.exceptions import ProcessingError
 from app.mymodels import ModelType
 from app import retry_async  # Assuming you have a custom retry decorator
-
 
 # Suppress the GuessedAtParserWarning from BeautifulSoup used within the wikipedia library
 warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
@@ -56,7 +54,7 @@ def validate_markdown_table(markdown: str, logger: logging.Logger) -> bool:
     table_pattern = re.compile(r'^\|.*\|$', re.MULTILINE)
     tables = table_pattern.findall(markdown)
     for table in tables:
-        rows = table.split('\n')
+        rows = table.strip().split('\n')
         if not rows:
             continue
         # Determine the number of columns from the header
@@ -112,7 +110,7 @@ class ReportPostProcessor:
         Args:
             corrected_content (str): The preprocessed story content.
             resolved_entities (List[Dict[str, Any]]): List of resolved entities.
-            wiki_info (Dict[str, Any]): Retrieved Wikipedia information.
+            wiki_info (Dict[str, Any]]): Retrieved Wikipedia information.
             sentiment (Optional[str]): Overall sentiment of the story.
             concepts (Optional[List[str]]): Key concepts extracted from the story.
             emotions (Optional[List[str]]): Emotions detected in the story.
@@ -376,155 +374,93 @@ class ReportPostProcessor:
 
             self.loggers['llm'].debug(f"Final extracted entities after NLP integration: {processed_entities}")
             return processed_entities
-        finally: pass
-        async def process_full_report(self, processed_results: List[Any]) -> str:
-            """
-            Combine individual analyses into a full report.
 
-            Args:
-                processed_results (List[Any]): List of ProcessingResult objects.
+        except Exception as e:
+            self.loggers['errors'].error(f"Error extracting entities: {e}")
+            return []
 
-            Returns:
-                str: The full refined analysis report.
-            """
-            report_lines = ["# Refined Analysis Report\n"]
-            all_analyses = []
+    async def process_full_report(self, processed_results: List[Any]) -> str:
+        """
+        Combine individual analyses into a full report.
 
-            for result in processed_results:
-                if getattr(result, 'success', False) and getattr(result, 'data', None):
-                    data = result.data
-                    story_id = getattr(data, 'story_id', 'Unknown')
-                    analysis = getattr(data, 'analysis', '')
-                    wiki_info = getattr(data, 'wiki_info', {})
+        Args:
+            processed_results (List[Any]): List of ProcessingResult objects.
 
-                    # Create story section
-                    story_section = [f"## Story ID: {story_id}\n"]
+        Returns:
+            str: The full refined analysis report.
+        """
+        report_lines = ["# Refined Analysis Report\n"]
+        all_analyses = []
 
-                    if analysis:
-                        # Create Analysis subsection
-                        story_section.extend([
-                            "### Analysis\n",
-                            f"{analysis}\n\n",
-                        ])
+        for result in processed_results:
+            if getattr(result, 'success', False) and getattr(result, 'data', None):
+                data = result.data
+                story_id = getattr(data, 'story_id', 'Unknown')
+                analysis = getattr(data, 'analysis', '')
+                wiki_info = getattr(data, 'wiki_info', {})
 
-                        # Extract entities from analysis
-                        entities = self.extract_entities_from_analysis(analysis)
-                        if entities:
-                            # Add '### Entities' table based on extracted entities
-                            story_section.extend([
-                                "### Entities\n",
-                                "| Name | Type | Description | Wikipedia Link |\n",
-                                "|------|------|-------------|----------------|\n"
-                            ])
-                            missing_entities = []
-                            for ent in entities:
-                                entity_name = ent.get('Entity', 'Unknown')
-                                entity_type = ent.get('Type', 'Unknown')
-                                description = ent.get('Description', 'No description available')
-                                wikipedia_link = ent.get('Wikipedia Link', '')
+                # Create story section
+                story_section = [f"## Story ID: {story_id}\n"]
 
-                                # Optionally, limit description length
-                                if len(description) > 100:
-                                    description = description[:100] + "..."
+                if analysis:
+                    # Create Analysis subsection
+                    story_section.extend([
+                        "### Analysis\n",
+                        f"{analysis}\n\n",
+                    ])
 
-                                # Sanitize all fields to prevent Markdown issues
-                                entity_name = sanitize_markdown(entity_name)
-                                entity_type = sanitize_markdown(entity_type)
-                                description = sanitize_markdown(description)
-
-                                # Format Wikipedia link
-                                if wikipedia_link:
-                                    # Check if it's already a Markdown link
-                                    if re.match(r'^https?://', wikipedia_link):
-                                        wikipedia_link_md = f"[Wikipedia]({wikipedia_link})"
-                                    else:
-                                        wikipedia_link_md = wikipedia_link  # Assume it's already formatted
-                                else:
-                                    wikipedia_link_md = ""
-
-                                wikipedia_link_md = sanitize_markdown(wikipedia_link_md)
-
-                                story_section.append(f"| {entity_name} | {entity_type} | {description} | {wikipedia_link_md} |\n")
-
-                                # Collect missing entities
-                                if entity_type.lower() == "missing":
-                                    missing_entities.append(ent)
-
-                            # Handle Missing Entities
-                            if missing_entities:
-                                story_section.extend([
-                                    "\n### Missing Entities\n",
-                                    ""
-                                ])
-                                for idx, missing in enumerate(missing_entities, 1):
-                                    missing_entity_name = sanitize_markdown(missing['Entity'])
-                                    missing_description = sanitize_markdown(missing['Description'])
-                                    story_section.append(f"{idx}. **{missing_entity_name}**: {missing_description}\n")
-                            else:
-                                story_section.extend([
-                                    "\n### Missing Entities\n",
-                                    "No missing entities identified.\n"
-                                ])
-
-                            all_analyses.append(analysis)
-                        else:
-                            # No entities extracted
-                            story_section.extend([
-                                "### Entities\n",
-                                "No entities extracted for this story.\n",
-                                "### Missing Entities\n",
-                                "No missing entities identified.\n"
-                            ])
-                    else:
-                        # No analysis available
-                        story_section.extend([
-                            "### Analysis\n",
-                            "No analysis available for this story.\n",
-                            "### Entities\n",
-                            "No entities extracted for this story.\n",
-                            "### Missing Entities\n",
-                            "No missing entities identified.\n"
-                        ])
-
-                    story_section.append("\n---\n")
-                    report_lines.extend(story_section)
+                    # Do not add '### Entities' and '### Missing Entities' sections here
+                    all_analyses.append(analysis)
                 else:
-                    error_message = getattr(result, 'error', "Unknown error")
-                    error_message = sanitize_markdown(error_message)
-                    report_lines.extend([
-                        f"## Story ID: Unknown\n",
-                        f"Error processing story: {error_message}\n",
-                        "\n---\n"
+                    # No analysis available
+                    story_section.extend([
+                        "### Analysis\n",
+                        "No analysis available for this story.\n",
+                        "### Entities\n",
+                        "No entities extracted for this story.\n",
+                        "### Missing Entities\n",
+                        "No missing entities identified.\n"
                     ])
 
-            # Generate summary from all analyses
-            if all_analyses:
-                try:
-                    overall_summary = await self.generate_summary(all_analyses)
-                    # Sanitize summary before adding
-                    overall_summary = sanitize_markdown(overall_summary)
-                    report_lines.extend([
-                        "# Summary of All Reports\n",
-                        f"{overall_summary}\n"
-                    ])
-                except Exception as e:
-                    self.loggers['errors'].error(f"Failed to generate overall summary: {e}")
-                    report_lines.extend([
-                        "# Summary of All Reports\n",
-                        "Failed to generate summary due to an error.\n"
-                    ])
+                story_section.append("\n---\n")
+                report_lines.extend(story_section)
             else:
+                error_message = getattr(result, 'error', "Unknown error")
+                error_message = sanitize_markdown(error_message)
                 report_lines.extend([
-                    "# Summary of All Reports\n",
-                    "No valid analyses available to generate a summary.\n"
+                    f"## Story ID: Unknown\n",
+                    f"Error processing story: {error_message}\n",
+                    "\n---\n"
                 ])
 
-            final_report = '\n'.join(report_lines)
-            # Validate the final report's Markdown tables
-            if not validate_markdown_table(final_report, self.loggers['errors']):
-                self.loggers['errors'].error("Generated Markdown report contains malformed tables.")
-                raise ProcessingError("Generated Markdown report contains malformed tables.")
-            return final_report
+        # Generate summary from all analyses
+        if all_analyses:
+            try:
+                overall_summary = await self.generate_summary(all_analyses)
+                # Sanitize summary before adding
+                overall_summary = sanitize_markdown(overall_summary)
+                report_lines.extend([
+                    "# Summary of All Reports\n",
+                    f"{overall_summary}\n"
+                ])
+            except Exception as e:
+                self.loggers['errors'].error(f"Failed to generate overall summary: {e}")
+                report_lines.extend([
+                    "# Summary of All Reports\n",
+                    "Failed to generate summary due to an error.\n"
+                ])
+        else:
+            report_lines.extend([
+                "# Summary of All Reports\n",
+                "No valid analyses available to generate a summary.\n"
+            ])
+
+        final_report = '\n'.join(report_lines)
+        # Validate the final report's Markdown tables
+        if not validate_markdown_table(final_report, self.loggers['errors']):
+            self.loggers['errors'].error("Generated Markdown report contains malformed tables.")
+            raise ProcessingError("Generated Markdown report contains malformed tables.")
+        return final_report
 
     @retry_async()
     async def generate_summary(self, reports: List[str]) -> str:
@@ -575,38 +511,6 @@ class ReportPostProcessor:
         except Exception as e:
             self.loggers['errors'].error(f"Failed to generate summary: {e}")
             raise ProcessingError(f"Failed to generate summary: {str(e)}")
-
-    async def refine_report(
-        self,
-        original_story: str,
-        generated_report: str,
-        wikipedia_info: str,
-        wikipedia_sections: str,
-        sentiment: Optional[str] = None,
-        concepts: Optional[List[str]] = None,
-        emotions: Optional[List[str]] = None,
-        keywords: Optional[List[str]] = None,
-        relations: Optional[Any] = None,
-    ) -> str:
-        """
-        Refine the generated report by integrating Wikipedia information and additional analysis data.
-
-        Args:
-            original_story (str): The original story content.
-            generated_report (str): The initial generated report.
-            wikipedia_info (str): Aggregated Wikipedia information related to the story.
-            wikipedia_sections (str): Specific sections from Wikipedia pages.
-            sentiment (Optional[str]]): Overall sentiment of the story.
-            concepts (Optional[List[str]]): Key concepts extracted from the story.
-            emotions (Optional[List[str]]): Emotions detected in the story.
-            keywords (Optional[List[str]]): Keywords extracted from the story.
-            relations (Optional[Any]]): Relationships between entities.
-
-        Returns:
-            str: The refined report with integrated information.
-        """
-        # This method is now redundant and can be removed to avoid duplication
-        raise NotImplementedError("Use generate_analysis method instead.")
 
     def get_entity_description(self, entity: Dict[str, str]) -> str:
         """
