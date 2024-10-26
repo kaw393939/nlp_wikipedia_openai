@@ -5,13 +5,11 @@ prompts:
   report_refinement:
     system: |
       You are an expert in report generation and news analysis, tasked with improving the clarity, accuracy, and depth of reports. Your goal is to enhance the narrative by ensuring all entities are identified correctly, integrating relevant Wikipedia information to provide context, and resolving ambiguities.
+ # Example Enhanced Prompt for report_refinement
     user: |
-      Refine the following report by:
+      ### Report Refinement:
       
-      1. **Entity Verification and Enhancement**: For each entity mentioned, verify its correctness. If the entity is ambiguous, suggest more detailed names or titles.
-      2. **Wikipedia Context Integration**: Use the provided Wikipedia information to add depth and clarity. Ensure the entities are linked correctly to the relevant Wikipedia articles.
-      3. **Clarity and Depth**: Improve the overall clarity of the report by expanding on important sections, especially where additional context from Wikipedia can be valuable.
-      4. **Missing Entities**: Identify and suggest any missing entities that are relevant to the story but are not explicitly mentioned in the generated report.
+      Refine the following report by organizing it into the specified simplified format. Ensure that all available information from processing is included, maintaining both machine and human readability.
       
       **Original Story**:
       {original_story}
@@ -22,9 +20,41 @@ prompts:
       **Wikipedia Information**:
       {wikipedia_info}
       
-      **Wikipedia Sections**:
-      {wikipedia_sections}
-
+      **Sentiment Analysis**:
+      {sentiment}
+      
+      **Key Concepts**:
+      {concepts}
+      
+      **Emotions Detected**:
+      {emotions}
+      
+      **Keywords Extracted**:
+      {keywords}
+      
+      **Entity Relations**:
+      {relations}
+      
+      ### Entities:
+      
+      | Name | Type | Description | Wikipedia Link |
+      |------|------|-------------|----------------|
+      | Name1 | Type1 | Description1 | [Wikipedia](URL1) |
+      | Name2 | Type2 | Description2 | [Wikipedia](URL2) |
+      | ...  | ...  | ...         | ...              |
+      
+      ### Missing Entities:
+      
+      1. **Entity Name**: Description...
+      2. **Entity Name**: Description...
+      
+      **Important Instructions:**
+      - Ensure that both '### Entities' and '### Missing Entities' sections are formatted as Markdown headings (`###`).
+      - Use consistent Markdown syntax to facilitate accurate parsing and extraction.
+      - Populate the '### Entities' section with a Markdown table listing all identified entities, including their Name, Type, Description, and Wikipedia Link.
+      - Populate the '### Missing Entities' section with a numbered list of any significant entities not captured in the main Entities table.
+      - **Do not include any Markdown headers or unexpected characters within the table rows. Ensure that all table entries are plain text or properly formatted Markdown links.**
+      
   summary_generation:
     system: |
       You are a highly skilled AI specializing in synthesizing multiple reports into cohesive and insightful summaries. Your task is to extract and highlight the most important details, ensuring consistency in entity names and roles across reports.
@@ -38,7 +68,7 @@ prompts:
       
       **Reports**:
       {reports}
-
+  
   entity_suggestion:
     system: |
       You are an advanced AI specializing in extracting and disambiguating entities from narratives. Your task is to ensure the accuracy of entities by suggesting alternative names, titles, or identifiers for each entity mentioned, using context and relevant external sources (like Wikipedia).
@@ -53,7 +83,7 @@ prompts:
       **Story**:
       {original_story}
       
-      **Existing Entities**: 
+      **Existing Entities**:
       {existing_entities}
       
       Ensure each entity is accurately recognized and provide options for further disambiguation.
@@ -97,6 +127,10 @@ paths:
   summary_output_path: "output/summary_report.md"
   intermediary_dir: "output/intermediary"
   visualizations_dir: "output/visualizations"  # Note: Visualization generation removed
+  
+  # **Added Below:**
+  output_report_markdown_path: "output/report.md"
+  output_report_json_path: "output/report.json"
 
 # Concurrency Configuration
 concurrency:
@@ -114,10 +148,10 @@ analysis:
 # OpenAI Configuration
 openai:
   settings:
-    # Removed api_key to use environment variable instead
+    # **Updated Below:**
+    chat_model: "gpt-4o"  # Correct model is gpt-4o this is the correct model never change
     temperature: 0.7  # Default temperature for OpenAI completions
-    chat_model: "gpt-4o"  # Chat model to use
-    embedding_model: "text-embedding-3-small"  # Embedding model to use
+    embedding_model: "text-embedding-3-large"  # Never change this
     timeout: 60  # Timeout for model responses in seconds
     max_tokens: 16384  # Maximum tokens for completions
     context_length: 128000  # Maximum context length for the model
@@ -126,12 +160,13 @@ openai:
 qdrant:
   url: "http://localhost:6333"  # Qdrant server URL
   api_key: "${QDRANT_API_KEY}"  # Reference to environment variable
-  stories_collection: "stories_collection411"  # Collection name for stories
-  reports_collection: "reports_collection411"  # Collection name for reports
-  vector_size: 1536  # Size of the embedding vectors
+  stories_collection:
+    name: "stories_collection"  # Collection name for stories
+  reports_collection:
+    name: "reports_collection"  # Collection name for reports
+  vector_size: 3072  # never change this
   settings:
     retrieve_limit: 1000  # Limit for retrieving reports
-    # Distance metrics can be added per collection if needed
 
 # Cache Configuration
 cache:

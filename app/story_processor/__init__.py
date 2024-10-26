@@ -11,31 +11,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiofiles
-import aiohttp
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from cachetools import LRUCache
-from aiolimiter import AsyncLimiter
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
 
-from app import retry_async  # Custom retry decorator
-from app.config_manager import ConfigManager  # Configuration manager
-from app.entity_processing import EnhancedEntityProcessor  # Enhanced Entity Processor
-from app.exceptions import ProcessingError  # Custom exception
-from app.reports import ReportPostProcessor  # Report post-processor
-from app.results_processing.___init___ import ProcessingResult
+from app import retry_async
+from app.config_manager import ConfigManager
+from app.entity_processing import EnhancedEntityProcessor
+from app.exceptions import ProcessingError
+from app.reports import ReportPostProcessor
+from app.entity_processing import ProcessingResult, StoryAnalysisResult
 from app.workers import (
     extract_and_resolve_entities_worker,
     preprocess_text_worker,
-)  # Worker functions
-from app.mymodels import ModelType  # Model types for configurations
+)
+from app.mymodels import ModelType
 
 
 class StoryProcessor:
@@ -49,30 +40,29 @@ class StoryProcessor:
         """
         self.config_manager = config_manager
         self.loggers = loggers
-        paths_config = self.config_manager.get_paths_config()
-        
+
         # Qdrant related attributes
         self.stories_collection_name: str = ''
         self.reports_collection_name: str = ''
         self.vector_size: int = 1536
         self.qdrant_client: Optional[QdrantClient] = None
-        
+
         # Story storage
         self.stories: Dict[str, str] = {}
         self.analysis_results: Dict[str, Dict[str, Any]] = {}
-        
+
         # OpenAI and ReportPostProcessor
         self.openai_client: Optional[AsyncOpenAI] = None
         self.report_post_processor: Optional[ReportPostProcessor] = None
-        
+
         # Process pool for CPU-bound tasks
         process_pool_config = self.config_manager.get_process_pool_config()
         max_workers = process_pool_config.get('max_workers', multiprocessing.cpu_count())
         self.process_pool = ProcessPoolExecutor(max_workers=max_workers)
-        
+
         # Enhanced Entity Processor
         self.entity_processor: Optional[EnhancedEntityProcessor] = None
-        
+
         # Initialize services
         self.initialize()
 
@@ -113,25 +103,36 @@ class StoryProcessor:
         """
         Initialize the Qdrant client and set up necessary collections.
         """
-        qdrant_config = self.config_manager.config.get('qdrant', {}).get('settings', {})
+        qdrant_config = self.config_manager.get_qdrant_config()
         try:
             self.qdrant_client = QdrantClient(
-                host=qdrant_config.get('host', 'localhost'),
-                port=int(qdrant_config.get('port', 6333)),
+                url=qdrant_config.get('url', 'http://localhost:6333'),
+                api_key=qdrant_config.get('api_key', None),
                 timeout=self.config_manager.get_model_config(ModelType.EMBEDDING).get('timeout', 60)
             )
             self.loggers['main'].info("Qdrant client initialized successfully.")
 
             # Initialize collections
-            self.stories_collection_name = qdrant_config.get('stories_collection', {}).get('name', 'stories_collection')
-            self.vector_size = int(qdrant_config.get('stories_collection', {}).get('vector_size', 1536))
-            distance_metric_stories = qdrant_config.get('stories_collection', {}).get('distance', 'COSINE').upper()
+            stories_collection = qdrant_config.get('stories_collection', {})
+            if isinstance(stories_collection, dict):
+                self.stories_collection_name = stories_collection.get('name', 'stories_collection')
+            else:
+                self.stories_collection_name = stories_collection
+
+            reports_collection = qdrant_config.get('reports_collection', {})
+            if isinstance(reports_collection, dict):
+                self.reports_collection_name = reports_collection.get('name', 'reports_collection')
+            else:
+                self.reports_collection_name = reports_collection
+
+            self.vector_size = int(qdrant_config.get('vector_size', 1536))
+
+            distance_metric_stories = stories_collection.get('distance', 'COSINE').upper() if isinstance(stories_collection, dict) else 'COSINE'
             self._initialize_collection(self.stories_collection_name, self.vector_size, distance_metric_stories, 'stories')
 
-            self.reports_collection_name = qdrant_config.get('reports_collection', {}).get('name', 'reports_collection')
-            reports_vector_size = int(qdrant_config.get('reports_collection', {}).get('vector_size', 1536))
-            distance_metric_reports = qdrant_config.get('reports_collection', {}).get('distance', 'COSINE').upper()
-            self._initialize_collection(self.reports_collection_name, reports_vector_size, distance_metric_reports, 'reports')
+            distance_metric_reports = reports_collection.get('distance', 'COSINE').upper() if isinstance(reports_collection, dict) else 'COSINE'
+            self._initialize_collection(self.reports_collection_name, self.vector_size, distance_metric_reports, 'reports')
+
         except Exception as e:
             self.loggers['errors'].error(f"Failed to initialize Qdrant client: {str(e)}")
             raise ProcessingError(f"Qdrant client initialization failed: {str(e)}")
@@ -316,8 +317,7 @@ class StoryProcessor:
     @retry_async()
     async def process_story_async(self, story_id: str, content: str) -> ProcessingResult:
         """
-        Process a single story asynchronously, including preprocessing, entity resolution,
-        embedding generation, and storing in Qdrant.
+        Process a single story asynchronously using the EnhancedEntityProcessor.
 
         Args:
             story_id (str): Unique identifier for the story.
@@ -327,70 +327,42 @@ class StoryProcessor:
             ProcessingResult: Result of the processing, indicating success or failure.
         """
         try:
-            self.loggers['main'].debug(f"Starting preprocessing for story '{story_id}'.")
-            corrected_content = await asyncio.get_running_loop().run_in_executor(
-                self.process_pool, preprocess_text_worker, content
-            )
-            self.loggers['main'].debug(f"Preprocessing completed for story '{story_id}'.")
+            # Delegate processing to the EnhancedEntityProcessor
+            result = await self.entity_processor.process_story_async(story_id, content)
 
-            resolved_entities = await asyncio.get_running_loop().run_in_executor(
-                self.process_pool, extract_and_resolve_entities_worker, corrected_content
-            )
-            self.loggers['main'].debug(
-                f"Entities extracted for story '{story_id}': {resolved_entities}"
-            )
+            if result.success and result.data:
+                # Save intermediary data
+                await self._save_intermediary_data_async(
+                    data=result.data.embedding,
+                    path=f"embeddings/{story_id}.json",
+                    data_type='embedding'
+                )
+                await self._save_intermediary_data_async(
+                    data=result.data.analysis,
+                    path=f"analysis/{story_id}.json",
+                    data_type='analysis'
+                )
 
-            wiki_info = await self.entity_processor.get_entities_info(
-                resolved_entities, corrected_content
-            )
-            self.loggers['llm'].debug(f"Generated wiki_info for story '{story_id}'.")
+                # Store the story embedding in Qdrant
+                story_uuid = self._generate_report_id()
+                points = self._prepare_qdrant_points(
+                    self.stories_collection_name,
+                    story_uuid,
+                    result.data.corrected_content,
+                    result.data.wiki_info,
+                    result.data.embedding,
+                    story_id
+                )
+                await self._store_points_in_qdrant(self.stories_collection_name, points)
+                self.loggers['main'].debug(f"Stored embedding in Qdrant for story '{story_id}'.")
 
-            self.loggers['llm'].debug(f"Generating embedding for story '{story_id}'.")
-            embedding = await self._get_embedding_async(corrected_content)
-            self.loggers['llm'].debug(f"Embedding generated for story '{story_id}'.")
-
-            await self._save_intermediary_data_async(
-                data=embedding,
-                path=f"embeddings/{story_id}.json",
-                data_type='embedding'
-            )
-
-            story_uuid = self._generate_report_id()
-            points = self._prepare_qdrant_points(
-                self.stories_collection_name,
-                story_uuid,
-                corrected_content,
-                wiki_info,
-                embedding,
-                story_id
-            )
-            await self._store_points_in_qdrant(self.stories_collection_name, points)
-            self.loggers['main'].debug(f"Stored embedding in Qdrant for story '{story_id}'.")
-
-            self.loggers['llm'].debug(f"Generating analysis for story '{story_id}'.")
-            analysis = await self.report_post_processor.generate_analysis(
-                corrected_content, resolved_entities, wiki_info
-            )
-            self.loggers['llm'].debug(f"Analysis generated for story '{story_id}'.")
-
-            await self._save_intermediary_data_async(
-                data=analysis,
-                path=f"analysis/{story_id}.json",
-                data_type='analysis'
-            )
-
-            # Construct the processing result
-            result = {
-                'story_id': story_id,
-                'entities': resolved_entities,
-                'wiki_info': wiki_info,
-                'analysis': analysis,
-                'embedding': embedding,
-                'timestamp': datetime.now().isoformat(),
-                # 'entity_frequency_chart': chart_path  # Removed as per requirements
-            }
-            self.loggers['main'].info(f"Successfully processed story '{story_id}'.")
-            return ProcessingResult(success=True, data=result)
+                # Return the processing result
+                self.loggers['main'].info(f"Successfully processed story '{story_id}'.")
+                return result
+            else:
+                # Log and return the error from entity processor
+                self.loggers['errors'].error(f"Failed to process story '{story_id}': {result.error}")
+                return result
 
         except ProcessingError as pe:
             self.loggers['errors'].error(f"Failed to process story '{story_id}': {str(pe)}")
@@ -437,7 +409,7 @@ class StoryProcessor:
                 if isinstance(result, ProcessingResult):
                     processed_results.append(result)
                     if result.success and result.data:
-                        wiki_info[result.data['story_id']] = result.data.get('wiki_info', {})
+                        wiki_info[result.data.story_id] = result.data.wiki_info
                 elif isinstance(result, Exception):
                     self.loggers['errors'].error(f"Error processing story: {str(result)}")
                     processed_results.append(
@@ -460,16 +432,16 @@ class StoryProcessor:
             # Store refined reports in Qdrant
             for result in processed_results:
                 if result.success and result.data:
-                    story_id = result.data['story_id']
-                    report_content = result.data['analysis']
-                    wiki_info_content = json.dumps(result.data['wiki_info'], indent=2)
+                    story_id = result.data.story_id
+                    report_content = result.data.analysis
+                    wiki_info_content = json.dumps(result.data.wiki_info, indent=2)
                     report_id = self._generate_report_id()
                     embedding = await self._get_embedding_async(report_content)
                     report_points = self._prepare_qdrant_points(
                         self.reports_collection_name,
                         report_id,
                         report_content,
-                        result.data['wiki_info'],
+                        result.data.wiki_info,
                         embedding,
                         story_id
                     )
@@ -481,23 +453,9 @@ class StoryProcessor:
                         f"Refined report for story '{story_id}' stored in '{self.reports_collection_name}' collection."
                     )
 
-            # Retrieve all reports for summary
-            all_reports = await self._retrieve_all_reports_async(
-                self.reports_collection_name
-            )
-            if not all_reports:
-                self.loggers['main'].warning(
-                    "No reports found in the reports collection to generate a summary."
-                )
-                summary = "No reports available to generate a summary."
-            else:
-                self.loggers['llm'].debug(
-                    "Generating summary from all stored reports."
-                )
-                summary = await self.report_post_processor.generate_summary(all_reports)
-            await self._save_report_async(summary, summary_output_path)
+            # Generate summary report
+            await self.generate_summary_report(summary_output_path)
 
-            # Removed visualization generation as per requirements
             self.loggers['main'].info(
                 f"Processing complete. Refined reports saved to '{self.reports_collection_name}' and summary saved to '{summary_output_path}'."
             )
@@ -646,32 +604,29 @@ class StoryProcessor:
         """
         try:
             all_reports = []
-            limit = self.config_manager.config.get('qdrant', {}).get(
+            limit = self.config_manager.get_qdrant_config().get(
                 'settings', {}
             ).get('retrieve_limit', 1000)
-            scroll_result = self.qdrant_client.scroll(
+            scroll_result, _ = self.qdrant_client.scroll(
                 collection_name=collection_name,
                 limit=limit,
                 with_payload=True,
                 with_vectors=False
             )
-            if scroll_result is None:
+            if not scroll_result:
                 self.loggers['main'].warning(
                     f"No data returned from '{collection_name}' collection."
                 )
                 return all_reports
-            for batch in scroll_result:
-                if not batch:
-                    break
-                for record in batch:
-                    if isinstance(record, models.Record) and record.payload:
-                        content = record.payload.get('content', '')
-                        if content:
-                            all_reports.append(content)
-                    else:
-                        self.loggers['errors'].warning(
-                            f"Unexpected record type or missing payload: {record}"
-                        )
+            for record in scroll_result:
+                if isinstance(record, models.Record) and record.payload:
+                    content = record.payload.get('content', '')
+                    if content:
+                        all_reports.append(content)
+                else:
+                    self.loggers['errors'].warning(
+                        f"Unexpected record type or missing payload: {record}"
+                    )
             self.loggers['main'].info(
                 f"Retrieved {len(all_reports)} reports from '{collection_name}' collection."
             )
@@ -723,4 +678,3 @@ class StoryProcessor:
             self.loggers['errors'].error(
                 f"Failed to generate summary report: {str(e)}"
             )
-

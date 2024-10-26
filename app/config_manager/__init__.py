@@ -22,13 +22,14 @@ class ConfigManager:
     _instance: Optional['ConfigManager'] = None
     _lock: threading.Lock = threading.Lock()
 
-    def __new__(cls, config_dir: str = "config", env_path: str = ".env"):
+    def __new__(cls, config_dir: str = "config", env_path: str = ".env") -> 'ConfigManager':
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super(ConfigManager, cls).__new__(cls)
                     cls._instance.config_dir = Path(config_dir)
                     cls._instance.config: Dict[str, Any] = {}
+                    cls._instance.logger = logging.getLogger('ConfigManager')
                     cls._instance._load_dotenv(env_path)
                     cls._instance._load_configs()
         return cls._instance
@@ -40,9 +41,9 @@ class ConfigManager:
         env_file = Path(env_path)
         if env_file.exists():
             load_dotenv(dotenv_path=env_file)
-            logging.getLogger('main').info(f".env file loaded from {env_file.resolve()}")
+            self.logger.info(f".env file loaded from {env_file.resolve()}")
         else:
-            logging.getLogger('errors').warning(f".env file not found at {env_file.resolve()}")
+            self.logger.warning(f".env file not found at {env_file.resolve()}")
 
     def _read_yaml_file(self, filepath: Path) -> Dict[str, Any]:
         """
@@ -68,12 +69,13 @@ class ConfigManager:
         except yaml.YAMLError as e:
             raise ConfigError(f"Error parsing YAML file {filepath.resolve()}: {str(e)}")
         except Exception as e:
+            self.logger.error(f"Unexpected error reading configuration file {filepath.resolve()}: {str(e)}", exc_info=True)
             raise ConfigError(f"Unexpected error reading configuration file {filepath.resolve()}: {str(e)}")
 
     def _load_configs(self) -> None:
         """
         Load and validate the configuration from the YAML file.
-        
+
         Raises:
             ConfigError: If required sections or keys are missing.
         """
@@ -83,7 +85,7 @@ class ConfigManager:
                 raise ConfigError(f"Configuration file does not exist: {config_path.resolve()}")
 
             self.config = self._read_yaml_file(config_path)
-            logging.getLogger('main').debug(f"Raw Configurations Loaded: {self.config}")
+            self.logger.debug(f"Raw Configurations Loaded: {self.config}")
 
             # Define required top-level sections
             required_sections = [
@@ -91,9 +93,9 @@ class ConfigManager:
                 'retry', 'aiohttp', 'process_pool', 'paths',
                 'concurrency', 'analysis', 'cache'
             ]
-            for section in required_sections:
-                if section not in self.config:
-                    raise ConfigError(f"Missing required configuration section: '{section}'")
+            missing_sections = [section for section in required_sections if section not in self.config]
+            if missing_sections:
+                raise ConfigError(f"Missing required configuration sections: {', '.join(missing_sections)}")
 
             # Specific validation for OpenAI settings
             openai_settings = self.config.get('openai', {}).get('settings', {})
@@ -105,13 +107,13 @@ class ConfigManager:
             if not api_key:
                 raise ConfigError("OpenAI API key not found in environment variables or config.yaml")
 
-            logging.getLogger('main').info("Configuration loaded and validated successfully")
+            self.logger.info("Configuration loaded and validated successfully")
         except ConfigError as e:
-            logging.getLogger('errors').error(f"Configuration validation error: {str(e)}")
+            self.logger.error(f"Configuration validation error: {str(e)}", exc_info=True)
             raise
         except Exception as e:
-            logging.getLogger('errors').error(f"Unexpected error during configuration loading: {str(e)}")
-            raise
+            self.logger.error(f"Unexpected error during configuration loading: {str(e)}", exc_info=True)
+            raise ConfigError(f"Unexpected error during configuration loading: {str(e)}")
 
     def get_openai_api_key(self) -> str:
         """
@@ -125,16 +127,17 @@ class ConfigManager:
         """
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
-            logging.getLogger('main').debug("OPENAI_API_KEY retrieved from environment variables")
+            self.logger.debug("OPENAI_API_KEY retrieved from environment variables")
             return api_key
 
         # Fallback to config.yaml if environment variable is not set
         api_key = self.config.get('openai', {}).get('settings', {}).get('api_key')
         if api_key:
-            logging.getLogger('main').warning("OPENAI_API_KEY retrieved from config.yaml. "
-                                             "It is recommended to use environment variables for sensitive information.")
+            self.logger.warning("OPENAI_API_KEY retrieved from config.yaml. "
+                                "It is recommended to use environment variables for sensitive information.")
             return api_key
 
+        self.logger.error("OpenAI API key not found in environment variables or config.yaml")
         raise ConfigError("OpenAI API key not found in environment variables or config.yaml")
 
     def get_model_config(self, model_type: ModelType) -> Dict[str, Any]:
@@ -152,31 +155,39 @@ class ConfigManager:
         """
         try:
             models_config = self.config['openai']['settings']
+            default_config = {
+                'timeout': float(models_config.get('timeout', 30.0)),
+                'context_length': int(models_config.get('context_length', 8192)),
+            }
             if model_type == ModelType.EMBEDDING:
                 return {
                     'model': models_config.get('embedding_model', 'text-embedding-ada-002'),
-                    'timeout': float(models_config.get('timeout', 30.0)),
-                    'context_length': int(models_config.get('context_length', 8192))
+                    **default_config
                 }
             elif model_type == ModelType.CHAT:
                 return {
                     'model': models_config.get('chat_model', 'gpt-4'),
                     'max_tokens': int(models_config.get('max_tokens', 4096)),
                     'temperature': float(models_config.get('temperature', 0.7)),
-                    'context_length': int(models_config.get('context_length', 8192))
+                    **default_config
                 }
             else:
+                self.logger.error(f"Unknown model type requested: {model_type}")
                 raise ValueError(f"Unknown model type: {model_type}")
         except KeyError as e:
+            self.logger.error(f"Missing configuration for {model_type}: {str(e)}", exc_info=True)
             raise ConfigError(f"Missing configuration for {model_type}: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Error retrieving model configuration for {model_type}: {str(e)}", exc_info=True)
+            raise ConfigError(f"Error retrieving model configuration for {model_type}: {str(e)}")
 
     def get_prompt(self, prompt_type: str, role: str) -> str:
         """
         Retrieve a specific prompt based on its type and role.
 
         Args:
-            prompt_type (str): The type of prompt (e.g., report_refinement).
-            role (str): The role within the prompt (e.g., system, user).
+            prompt_type (str): The type of prompt (e.g., 'report_refinement').
+            role (str): The role within the prompt (e.g., 'system', 'user').
 
         Returns:
             str: The requested prompt.
@@ -187,10 +198,15 @@ class ConfigManager:
         try:
             prompt = self.config['prompts'][prompt_type][role]
             if not prompt:
+                self.logger.error(f"Prompt not found for type '{prompt_type}' and role '{role}'")
                 raise ConfigError(f"Prompt not found for type '{prompt_type}' and role '{role}'")
             return prompt
         except KeyError as e:
+            self.logger.error(f"Missing prompt configuration: {str(e)}", exc_info=True)
             raise ConfigError(f"Missing prompt configuration: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Error retrieving prompt for type '{prompt_type}' and role '{role}': {str(e)}", exc_info=True)
+            raise ConfigError(f"Error retrieving prompt for type '{prompt_type}' and role '{role}': {str(e)}")
 
     def get_logging_config(self) -> Dict[str, Any]:
         """
@@ -283,14 +299,13 @@ class ConfigManager:
         """
         with self._lock:
             try:
-                logging.getLogger('main').info("Reloading configurations...")
+                self.logger.info("Reloading configurations...")
                 self._load_dotenv(env_path=".env")  # Reload environment variables
                 self._load_configs()  # Reload configurations
-                logging.getLogger('main').info("Configurations reloaded successfully")
+                self.logger.info("Configurations reloaded successfully")
             except Exception as e:
-                logging.getLogger('errors').error(f"Failed to reload configurations: {str(e)}")
-                raise
-
+                self.logger.error(f"Failed to reload configurations: {str(e)}", exc_info=True)
+                raise ConfigError(f"Failed to reload configurations: {str(e)}")
 
 # Example Usage
 if __name__ == "__main__":
@@ -301,8 +316,8 @@ if __name__ == "__main__":
     try:
         config_manager = ConfigManager()
         openai_key = config_manager.get_openai_api_key()
-        logging.info(f"OpenAI API Key Retrieved: {'***' + openai_key[-4:]}")  # Masked output
+        logging.getLogger('main').info(f"OpenAI API Key Retrieved: {'***' + openai_key[-4:]}")  # Masked output
     except ConfigError as ce:
-        logging.error(f"Configuration Error: {str(ce)}")
+        logging.getLogger('errors').error(f"Configuration Error: {str(ce)}")
     except Exception as ex:
-        logging.error(f"Unexpected Error: {str(ex)}")
+        logging.getLogger('errors').error(f"Unexpected Error: {str(ex)}", exc_info=True)

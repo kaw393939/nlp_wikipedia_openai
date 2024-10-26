@@ -12,39 +12,57 @@ import aiofiles
 import aiohttp
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from cachetools import LRUCache
 from aiolimiter import AsyncLimiter
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from rapidfuzz import process, fuzz
 from metaphone import doublemetaphone
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from langdetect import detect
-import yake  # Updated import for keyword extraction
+import yake
 
-from app import retry_async  # Custom retry decorator
-from app.config_manager import ConfigManager  # Configuration manager
-from app.reports import ReportPostProcessor  # Report post-processor
-from app.exceptions import ProcessingError  # Custom exception
-from app.results_processing.___init___ import ProcessingResult
-from app.workers import (
-    extract_and_resolve_entities_worker,
-    preprocess_text_worker,
-)  # Worker functions
-from app.mymodels import ModelType  # Model types for configurations
+from app import retry_async
+from app.config_manager import ConfigManager
+from app.reports import ReportPostProcessor
+from app.exceptions import ProcessingError
+from app.workers import extract_and_resolve_entities_worker, preprocess_text_worker
+from app.mymodels import ModelType
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ProcessingResult:
+    success: bool
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class StoryAnalysisResult:
+    """
+    Data class to hold all analysis results for a story.
+    """
+    story_id: str
+    language: str
+    corrected_content: str
+    entities: List[Dict[str, Any]]
+    wiki_info: Dict[str, Any]
+    sentiment: str
+    concepts: List[str]
+    emotions: List[str]
+    keywords: List[str]
+    relations: Any
+    summary: str
+    embedding: List[float]
+    analysis: str
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
 class EnhancedEntityProcessor:
     def __init__(
         self,
-        openai_client: AsyncOpenAI,
+        openai_client: Any,  # Replace with the correct type for your OpenAI client
         config_manager: ConfigManager,
         loggers: Dict[str, logging.Logger],
     ):
@@ -52,37 +70,34 @@ class EnhancedEntityProcessor:
         Initialize the EnhancedEntityProcessor with necessary clients, configurations, and loggers.
 
         Args:
-            openai_client (AsyncOpenAI): Asynchronous OpenAI client for LLM interactions.
+            openai_client (Any): Asynchronous OpenAI client for LLM interactions.
             config_manager (ConfigManager): Manages configuration settings.
             loggers (Dict[str, logging.Logger]): Dictionary of loggers for different modules.
         """
-        # Initialize LRU caches with configurable max sizes
-        cache_config = config_manager.config.get("cache", {})
-        self.wikipedia_cache = LRUCache(
-            maxsize=cache_config.get("wikipedia", {}).get("maxsize", 1000)
-        )
-        self.wikidata_cache = LRUCache(
-            maxsize=cache_config.get("wikidata", {}).get("maxsize", 1000)
-        )
-
+        self.logger = loggers.get("EnhancedEntityProcessor", logging.getLogger("EnhancedEntityProcessor"))
         self.openai_client = openai_client
         self.config_manager = config_manager
         self.loggers = loggers
 
+        # Initialize LRU caches with configurable max sizes
+        cache_config = config_manager.get_cache_config()
+        self.wikipedia_cache = LRUCache(maxsize=cache_config.get("wikipedia", {}).get("maxsize", 1000))
+        self.wikidata_cache = LRUCache(maxsize=cache_config.get("wikidata", {}).get("maxsize", 1000))
+
         # Initialize Qdrant client
-        qdrant_config = self.config_manager.config.get("qdrant", {})
+        qdrant_config = self.config_manager.get_qdrant_config()
         self.qdrant_client = QdrantClient(
             url=qdrant_config.get("url", "http://localhost:6333"),
             api_key=qdrant_config.get("api_key", None),
         )
-        self.stories_collection_name = qdrant_config.get("stories_collection", "stories")
-        self.reports_collection_name = qdrant_config.get("reports_collection", "reports")
-        self.vector_size = qdrant_config.get("vector_size", 1536)  # Example size
+        self.stories_collection_name = qdrant_config.get("stories_collection", {}).get("name", "stories")
+        self.reports_collection_name = qdrant_config.get("reports_collection", {}).get("name", "reports")
+        self.vector_size = int(qdrant_config.get("vector_size", 1536))
 
         # Initialize aiohttp configuration settings
         aiohttp_config = self.config_manager.get_aiohttp_config()
-        timeout_seconds = aiohttp_config.get("timeout", 60)  # Updated timeout
-        max_connections = aiohttp_config.get("max_connections", 10)  # Updated max connections
+        timeout_seconds = aiohttp_config.get("timeout", 60)
+        max_connections = aiohttp_config.get("max_connections", 10)
 
         # Setup aiohttp connector with connection limits
         connector = aiohttp.TCPConnector(limit=max_connections)
@@ -92,27 +107,21 @@ class EnhancedEntityProcessor:
         self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
         # Setup rate limiting using aiolimiter
-        rate_limit = aiohttp_config.get("rate_limit", 5)  # Max 5 requests per second
+        rate_limit = aiohttp_config.get("rate_limit", 5)
         self.limiter = AsyncLimiter(max_rate=rate_limit, time_period=1)
 
         # Initialize retry strategy using tenacity
+        retry_config = config_manager.get_retry_config()
         self.retry_strategy = retry(
             reraise=True,
-            stop=stop_after_attempt(
-                config_manager.config.get("retry", {}).get("retries", 5)
-            ),
+            stop=stop_after_attempt(retry_config.get("retries", 5)),
             wait=wait_exponential(
-                multiplier=config_manager.config.get("retry", {}).get("base_delay", 0.5),
-                min=config_manager.config.get("retry", {}).get("base_delay", 0.5),
-                max=10,
+                multiplier=retry_config.get("base_delay", 0.5),
+                min=retry_config.get("base_delay", 0.5),
+                max=retry_config.get("max_delay", 10),
             ),
-            retry=retry_if_exception_type(
-                (aiohttp.ClientError, asyncio.TimeoutError)
-            ),
+            retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
         )
-
-        # Initialize logger
-        self.logger = self.loggers.get("main", logging.getLogger("main"))
 
         # Initialize TF-IDF Vectorizer for context matching
         self.vectorizer = TfidfVectorizer(stop_words="english")
@@ -168,36 +177,29 @@ class EnhancedEntityProcessor:
             },
             {"role": "user", "content": prompt},
         ]
-        self.loggers["llm"].debug(
-            f"Messages sent to OpenAI for entity spelling correction: {messages}"
-        )
+        self.loggers["llm"].debug(f"Messages sent to OpenAI for entity spelling correction: {messages}")
 
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=10,
-                temperature=0.0,  # Deterministic output
+                temperature=0.0,
             )
             if response.choices and response.choices[0].message:
                 corrected = response.choices[0].message.content.strip()
                 # Basic validation to avoid irrelevant responses
                 if corrected and corrected.lower() != entity.lower():
-                    self.loggers["wikipedia"].info(
-                        f"Corrected entity name from '{entity}' to '{corrected}'"
-                    )
+                    self.loggers["wikipedia"].info(f"Corrected entity name from '{entity}' to '{corrected}'")
                     return corrected
         except Exception as e:
             # Log any exceptions that occur during the OpenAI request
-            self.loggers["llm"].error(
-                f"Spell correction failed for '{entity}': {str(e)}"
-            )
+            self.loggers["llm"].error(f"Spell correction failed for '{entity}': {str(e)}")
         return None
 
     @retry
-    async def suggest_alternative_entity_name(
-        self, entity: str, context: str
-    ) -> Optional[str]:
+    async def suggest_alternative_entity_name(self, entity: str, context: str) -> Optional[str]:
         """
         Suggest an alternative name for a given entity using OpenAI's language model, considering the context.
 
@@ -212,9 +214,7 @@ class EnhancedEntityProcessor:
         prompt_system = self.config_manager.get_prompt("entity_suggestion", "system") or (
             "You are an assistant that suggests alternative names for entities based on context."
         )
-        prompt_user_template = self.config_manager.get_prompt(
-            "entity_suggestion", "user"
-        ) or (
+        prompt_user_template = self.config_manager.get_prompt("entity_suggestion", "user") or (
             "Given the entity '{entity}' and the context: \"{context}\", suggest alternative names that might be used to find it on Wikipedia."
         )
         prompt_user = prompt_user_template.format(entity=entity, context=context)
@@ -224,44 +224,31 @@ class EnhancedEntityProcessor:
             {"role": "system", "content": prompt_system},
             {"role": "user", "content": prompt_user},
         ]
-        self.loggers["llm"].debug(
-            f"Messages sent to OpenAI for entity suggestion: {messages}"
-        )
+        self.loggers["llm"].debug(f"Messages sent to OpenAI for entity suggestion: {messages}")
 
         try:
-            # Make a request to OpenAI's chat completion API
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=50,
-                temperature=self.config_manager.config.get("openai", {}).get(
-                    "settings", {}
-                ).get("temperature", 0.7),
+                temperature=model_config.get("temperature", 0.7),
             )
-            # Check if the response contains choices and messages
             if not response.choices or not response.choices[0].message:
-                self.loggers["llm"].error(
-                    "OpenAI response is missing choices or messages."
-                )
+                self.loggers["llm"].error("OpenAI response is missing choices or messages.")
                 return None
             # Extract and clean the suggestion from the response
             suggestion = response.choices[0].message.content.strip()
             suggestion = suggestion.split("\n")[0].replace(".", "").strip()
             # Validate the suggestion to avoid irrelevant responses
             if suggestion.lower() in ["hello! how can i assist you today?"]:
-                self.loggers["llm"].error(
-                    f"Invalid suggestion received from OpenAI: '{suggestion}'"
-                )
+                self.loggers["llm"].error(f"Invalid suggestion received from OpenAI: '{suggestion}'")
                 return None
-            self.loggers["wikipedia"].debug(
-                f"Suggested alternative for '{entity}': '{suggestion}'"
-            )
+            self.loggers["wikipedia"].debug(f"Suggested alternative for '{entity}': '{suggestion}'")
             return suggestion
         except Exception as e:
             # Log any exceptions that occur during the OpenAI request
-            self.loggers["llm"].error(
-                f"Failed to suggest alternative entity name for '{entity}': {str(e)}"
-            )
+            self.loggers["llm"].error(f"Failed to suggest alternative entity name for '{entity}': {str(e)}")
             return None
 
     @retry
@@ -289,7 +276,7 @@ class EnhancedEntityProcessor:
             "language": "en",
             "search": entity,
             "type": "item",
-            "limit": 20,  # Increased limit for better matching
+            "limit": 20,
         }
 
         try:
@@ -302,23 +289,17 @@ class EnhancedEntityProcessor:
                             # Exact match
                             wikidata_id = search_results[0].get("id")
                             self.wikidata_cache[entity] = wikidata_id  # Cache the ID
-                            self.loggers["wikipedia"].debug(
-                                f"Fetched Wikidata ID for '{entity}': {wikidata_id}"
-                            )
+                            self.loggers["wikipedia"].debug(f"Fetched Wikidata ID for '{entity}': {wikidata_id}")
                             return wikidata_id
             # If no exact match found, perform Fuzzy Matching
             return await self.perform_fuzzy_and_phonetic_matching(entity, context)
         except Exception as e:
             # Log any exceptions that occur during the API request
-            self.loggers["wikipedia"].error(
-                f"Error fetching Wikidata ID for '{entity}': {e}"
-            )
+            self.loggers["wikipedia"].error(f"Error fetching Wikidata ID for '{entity}': {e}")
             return None
 
     @retry
-    async def perform_fuzzy_and_phonetic_matching(
-        self, entity: str, context: str
-    ) -> Optional[str]:
+    async def perform_fuzzy_and_phonetic_matching(self, entity: str, context: str) -> Optional[str]:
         """
         Perform Fuzzy and Phonetic matching to find the best Wikidata ID for the given entity.
 
@@ -336,7 +317,7 @@ class EnhancedEntityProcessor:
             "language": "en",
             "search": entity,
             "type": "item",
-            "limit": 20,  # Fetch more results for better matching
+            "limit": 20,
         }
 
         try:
@@ -346,9 +327,7 @@ class EnhancedEntityProcessor:
                         data = await resp.json()
                         search_results = data.get("search", [])
                         if not search_results:
-                            self.loggers["wikipedia"].warning(
-                                f"No search results found for '{entity}' during fuzzy and phonetic matching."
-                            )
+                            self.loggers["wikipedia"].warning(f"No search results found for '{entity}' during fuzzy and phonetic matching.")
                             return None
 
                         # Prepare list of entity names from search results
@@ -358,33 +337,24 @@ class EnhancedEntityProcessor:
                         best_fuzzy_match, fuzzy_score, _ = process.extractOne(
                             query=entity, choices=candidate_entities, scorer=fuzz.WRatio
                         )
-                        self.loggers["wikipedia"].debug(
-                            f"Best fuzzy match for '{entity}': '{best_fuzzy_match}' with score {fuzzy_score}"
-                        )
+                        self.loggers["wikipedia"].debug(f"Best fuzzy match for '{entity}': '{best_fuzzy_match}' with score {fuzzy_score}")
 
                         # Define a similarity threshold
-                        fuzzy_threshold = self.config_manager.config.get(
-                            "matching", {}
-                        ).get("fuzzy_threshold", 80)
+                        matching_config = self.config_manager.config.get("matching", {})
+                        fuzzy_threshold = matching_config.get("fuzzy_threshold", 80)
 
                         if fuzzy_score >= fuzzy_threshold:
                             # Find the Wikidata ID for the best fuzzy match
                             for result in search_results:
                                 if result["label"] == best_fuzzy_match:
                                     wikidata_id = result["id"]
-                                    self.wikidata_cache[
-                                        entity
-                                    ] = wikidata_id  # Cache the ID
-                                    self.loggers["wikipedia"].debug(
-                                        f"Fuzzy matched Wikidata ID for '{entity}': {wikidata_id}"
-                                    )
+                                    self.wikidata_cache[entity] = wikidata_id  # Cache the ID
+                                    self.loggers["wikipedia"].debug(f"Fuzzy matched Wikidata ID for '{entity}': {wikidata_id}")
                                     return wikidata_id
 
                         # Phonetic Matching using Metaphone
                         entity_metaphone = doublemetaphone(entity)[0]
-                        self.loggers["wikipedia"].debug(
-                            f"Metaphone code for '{entity}': {entity_metaphone}"
-                        )
+                        self.loggers["wikipedia"].debug(f"Metaphone code for '{entity}': {entity_metaphone}")
 
                         # Find candidates with matching metaphone codes
                         phonetic_candidates = [
@@ -395,31 +365,21 @@ class EnhancedEntityProcessor:
 
                         if phonetic_candidates:
                             wikidata_id = phonetic_candidates[0]["id"]
-                            self.wikidata_cache[
-                                entity
-                            ] = wikidata_id  # Cache the ID
-                            self.loggers["wikipedia"].debug(
-                                f"Phonetic matched Wikidata ID for '{entity}': {wikidata_id}"
-                            )
+                            self.wikidata_cache[entity] = wikidata_id  # Cache the ID
+                            self.loggers["wikipedia"].debug(f"Phonetic matched Wikidata ID for '{entity}': {wikidata_id}")
                             return wikidata_id
 
-                        self.loggers["wikipedia"].warning(
-                            f"No suitable fuzzy or phonetic match found for '{entity}'."
-                        )
+                        self.loggers["wikipedia"].warning(f"No suitable fuzzy or phonetic match found for '{entity}'.")
 
                         # Additional Step: Contextual Validation
-                        contextual_valid_id = await self.contextual_validate(
-                            entity, context, search_results
-                        )
+                        contextual_valid_id = await self.contextual_validate(entity, context, search_results)
                         if contextual_valid_id:
                             return contextual_valid_id
 
                         return None
             return None
         except Exception as e:
-            self.loggers["wikipedia"].error(
-                f"Error during fuzzy and phonetic matching for '{entity}': {e}"
-            )
+            self.loggers["wikipedia"].error(f"Error during fuzzy and phonetic matching for '{entity}': {e}")
             return None
 
     async def contextual_validate(
@@ -440,9 +400,7 @@ class EnhancedEntityProcessor:
             # Extract descriptions from search results
             descriptions = [result.get("description", "") for result in search_results]
             if not descriptions:
-                self.loggers["wikipedia"].warning(
-                    f"No descriptions available for contextual validation of '{entity}'."
-                )
+                self.loggers["wikipedia"].warning(f"No descriptions available for contextual validation of '{entity}'.")
                 return None
 
             # Fit the vectorizer on descriptions and context
@@ -454,42 +412,29 @@ class EnhancedEntityProcessor:
 
             # Calculate cosine similarity
             similarities = cosine_similarity(context_vector, description_vectors).flatten()
-            self.loggers["wikipedia"].debug(
-                f"Cosine similarities for '{entity}': {similarities}"
-            )
+            self.loggers["wikipedia"].debug(f"Cosine similarities for '{entity}': {similarities}")
 
             # Find the index with the highest similarity
             best_match_index = similarities.argmax()
             best_similarity = similarities[best_match_index]
-            self.loggers["wikipedia"].debug(
-                f"Best contextual similarity for '{entity}': {best_similarity} at index {best_match_index}"
-            )
+            self.loggers["wikipedia"].debug(f"Best contextual similarity for '{entity}': {best_similarity} at index {best_match_index}")
 
             # Define a similarity threshold for context
-            context_threshold = self.config_manager.config.get(
-                "matching", {}
-            ).get("context_threshold", 0.3)
+            matching_config = self.config_manager.config.get("matching", {})
+            context_threshold = matching_config.get("context_threshold", 0.3)
 
             if best_similarity >= context_threshold:
                 best_result = search_results[best_match_index]
                 wikidata_id = best_result.get("id")
-                self.wikidata_cache[
-                    entity
-                ] = wikidata_id  # Cache the ID
-                self.loggers["wikipedia"].debug(
-                    f"Contextually validated Wikidata ID for '{entity}': {wikidata_id}"
-                )
+                self.wikidata_cache[entity] = wikidata_id  # Cache the ID
+                self.loggers["wikipedia"].debug(f"Contextually validated Wikidata ID for '{entity}': {wikidata_id}")
                 return wikidata_id
             else:
-                self.loggers["wikipedia"].warning(
-                    f"Contextual similarity below threshold for '{entity}'."
-                )
+                self.loggers["wikipedia"].warning(f"Contextual similarity below threshold for '{entity}'.")
                 return None
         except Exception as e:
-            self.loggers["wikipedia"].error(
-                f"Error during contextual validation for '{entity}': {e}"
-            )
-            raise ProcessingError(f"Contextual validation failed: {str(e)}")
+            self.loggers["wikipedia"].error(f"Error during contextual validation for '{entity}': {e}")
+            raise ProcessingError(f"Contextual validation failed: {e}")
 
     @retry
     async def validate_entity(self, wikidata_id: str, context: str) -> bool:
@@ -535,9 +480,7 @@ class EnhancedEntityProcessor:
             return False
         except Exception as e:
             # Log any exceptions that occur during the validation
-            self.loggers["wikipedia"].error(
-                f"Error validating entity '{wikidata_id}': {e}"
-            )
+            self.loggers["wikipedia"].error(f"Error validating entity '{wikidata_id}': {e}")
             return False
 
     @retry
@@ -566,9 +509,7 @@ class EnhancedEntityProcessor:
                                 # Summarize the text
                                 summarized_text = await self._summarize_text(section_text)
                                 section_contents[section_title] = summarized_text
-                        self.loggers["wikipedia"].debug(
-                            f"Fetched sections for '{title}': {list(section_contents.keys())}"
-                        )
+                        self.loggers["wikipedia"].debug(f"Fetched sections for '{title}': {list(section_contents.keys())}")
                         return section_contents
                     else:
                         # Log an error if the request fails with a non-200 status
@@ -578,9 +519,7 @@ class EnhancedEntityProcessor:
                         return {}
         except Exception as e:
             # Log any exceptions that occur during the API request
-            self.loggers["wikipedia"].error(
-                f"Exception during Wikipedia sections request for '{title}': {e}"
-            )
+            self.loggers["wikipedia"].error(f"Exception during Wikipedia sections request for '{title}': {e}")
             return {}
 
     async def _summarize_text(self, text: str) -> str:
@@ -606,8 +545,9 @@ class EnhancedEntityProcessor:
         ]
         self.loggers["llm"].debug(f"Summarization prompt sent to OpenAI: {prompt}")
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=150,
                 temperature=0.5,
@@ -622,7 +562,7 @@ class EnhancedEntityProcessor:
                 )
                 return text  # Fallback to original text if summarization fails
         except Exception as e:
-            self.loggers["llm"].error(f"Failed to summarize text: {str(e)}")
+            self.loggers["llm"].error(f"Failed to summarize text: {e}")
             return text  # Fallback to original text in case of exception
 
     @retry_async()
@@ -644,17 +584,15 @@ class EnhancedEntityProcessor:
             )
             if not response.data or not response.data[0].embedding:
                 self.loggers["llm"].error("OpenAI response is missing embedding data.")
-                raise ProcessingError(
-                    "Failed to generate embedding due to invalid OpenAI response."
-                )
+                raise ProcessingError("Failed to generate embedding due to invalid OpenAI response.")
             embedding = response.data[0].embedding
             self.loggers["llm"].debug(
                 f"Generated embedding for text: {text[:30]}... [truncated]. Embedding size: {len(embedding)}"
             )
             return embedding
         except Exception as e:
-            self.loggers["llm"].error(f"Failed to generate embedding: {str(e)}")
-            raise ProcessingError(f"Failed to generate embedding: {str(e)}")
+            self.loggers["llm"].error(f"Failed to generate embedding: {e}")
+            raise ProcessingError(f"Failed to generate embedding: {e}")
 
     def _prepare_qdrant_points(
         self,
@@ -670,7 +608,7 @@ class EnhancedEntityProcessor:
 
         Args:
             collection_name (str): Name of the Qdrant collection.
-            point_id (str): Unique identifier for the point.
+            point_id: str): Unique identifier for the point.
             content (str): The content to be stored.
             wiki_info (Dict[str, Any]): Wikipedia information associated with the content.
             embedding (List[float]): Embedding vector.
@@ -680,9 +618,7 @@ class EnhancedEntityProcessor:
             List[models.PointStruct]: List containing the prepared point.
         """
         if not isinstance(embedding, list) or len(embedding) != self.vector_size:
-            raise ValueError(
-                f"Invalid embedding: expected list of length {self.vector_size}"
-            )
+            raise ValueError(f"Invalid embedding: expected list of length {self.vector_size}")
         payload = {
             "report_id": point_id,
             "story_id": story_id,
@@ -709,9 +645,7 @@ class EnhancedEntityProcessor:
         """
         return str(uuid.uuid4())
 
-    def _store_points_in_qdrant_sync(
-        self, collection_name: str, points: List[models.PointStruct]
-    ) -> None:
+    def _store_points_in_qdrant_sync(self, collection_name: str, points: List[models.PointStruct]) -> None:
         """
         Synchronously store points in Qdrant.
 
@@ -727,19 +661,13 @@ class EnhancedEntityProcessor:
             self.loggers["main"].info(
                 f"Stored {len(points)} point(s) in Qdrant collection '{collection_name}'. Operation ID: {operation_info.operation_id}"
             )
-            self.loggers["main"].info(
-                f"Upsert operation completed for collection '{collection_name}'"
-            )
+            self.loggers["main"].info(f"Upsert operation completed for collection '{collection_name}'")
         except UnexpectedResponse as e:
-            raise ProcessingError(f"Failed to store points in Qdrant: {str(e)}")
+            raise ProcessingError(f"Failed to store points in Qdrant: {e}")
         except Exception as e:
-            raise ProcessingError(
-                f"An unexpected error occurred while storing points in Qdrant: {str(e)}"
-            )
+            raise ProcessingError(f"An unexpected error occurred while storing points in Qdrant: {e}")
 
-    async def _store_points_in_qdrant(
-        self, collection_name: str, points: List[models.PointStruct]
-    ) -> None:
+    async def _store_points_in_qdrant(self, collection_name: str, points: List[models.PointStruct]) -> None:
         """
         Asynchronously store points in Qdrant by running the synchronous method in an executor.
 
@@ -748,9 +676,7 @@ class EnhancedEntityProcessor:
             points (List[models.PointStruct]): List of points to store.
         """
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, self._store_points_in_qdrant_sync, collection_name, points
-        )
+        await loop.run_in_executor(None, self._store_points_in_qdrant_sync, collection_name, points)
 
     async def perform_sentiment_analysis(self, text: str) -> str:
         """
@@ -765,20 +691,21 @@ class EnhancedEntityProcessor:
         prompt = f"Analyze the sentiment of the following text and respond with 'positive', 'negative', or 'neutral':\n\n{text}"
         messages = [{"role": "user", "content": prompt}]
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=1,
                 temperature=0.0,
             )
             sentiment = response.choices[0].message.content.strip().lower()
-            if sentiment in ['positive', 'negative', 'neutral']:
+            if sentiment in ["positive", "negative", "neutral"]:
                 return sentiment
             else:
                 self.loggers["llm"].warning(f"Unexpected sentiment result: {sentiment}")
                 return "unknown"
         except Exception as e:
-            self.loggers["errors"].error(f"Sentiment analysis failed: {str(e)}")
+            self.loggers["errors"].error(f"Sentiment analysis failed: {e}")
             return "unknown"
 
     async def extract_concepts(self, text: str) -> List[str]:
@@ -794,17 +721,18 @@ class EnhancedEntityProcessor:
         prompt = f"Identify the key concepts in the following text:\n\n{text}\n\nConcepts:"
         messages = [{"role": "user", "content": prompt}]
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=50,
                 temperature=0.5,
             )
             concepts = response.choices[0].message.content.strip()
-            concepts_list = [concept.strip() for concept in concepts.split(',') if concept.strip()]
+            concepts_list = [concept.strip() for concept in concepts.split(",") if concept.strip()]
             return concepts_list
         except Exception as e:
-            self.loggers["errors"].error(f"Concept extraction failed: {str(e)}")
+            self.loggers["errors"].error(f"Concept extraction failed: {e}")
             return []
 
     async def perform_entity_sentiment_analysis(self, entity: str, context: str) -> str:
@@ -821,20 +749,21 @@ class EnhancedEntityProcessor:
         prompt = f"In the following text, what is the sentiment towards '{entity}'? Respond with 'positive', 'negative', or 'neutral':\n\n{context}"
         messages = [{"role": "user", "content": prompt}]
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=1,
                 temperature=0.0,
             )
             sentiment = response.choices[0].message.content.strip().lower()
-            if sentiment in ['positive', 'negative', 'neutral']:
+            if sentiment in ["positive", "negative", "neutral"]:
                 return sentiment
             else:
                 self.loggers["llm"].warning(f"Unexpected entity sentiment result for '{entity}': {sentiment}")
                 return "unknown"
         except Exception as e:
-            self.loggers["errors"].error(f"Entity sentiment analysis failed for '{entity}': {str(e)}")
+            self.loggers["errors"].error(f"Entity sentiment analysis failed for '{entity}': {e}")
             return "unknown"
 
     async def extract_entity_relations(self, entities: List[str], text: str) -> Any:
@@ -851,8 +780,9 @@ class EnhancedEntityProcessor:
         prompt = f"Extract relationships between the following entities in the text: {', '.join(entities)}.\n\nText:\n{text}\n\nList the relationships:"
         messages = [{"role": "user", "content": prompt}]
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=150,
                 temperature=0.5,
@@ -860,7 +790,7 @@ class EnhancedEntityProcessor:
             relations_text = response.choices[0].message.content.strip()
             return relations_text
         except Exception as e:
-            self.loggers["errors"].error(f"Relation extraction failed: {str(e)}")
+            self.loggers["errors"].error(f"Relation extraction failed: {e}")
             return []
 
     async def perform_emotion_analysis(self, text: str) -> List[str]:
@@ -876,17 +806,18 @@ class EnhancedEntityProcessor:
         prompt = f"Identify the emotions expressed in the following text:\n\n{text}\n\nEmotions:"
         messages = [{"role": "user", "content": prompt}]
         try:
+            model_config = self.config_manager.get_model_config(ModelType.CHAT)
             response = await self.openai_client.chat.completions.create(
-                model=self.config_manager.get_model_config(ModelType.CHAT)["chat_model"],
+                model=model_config["model"],
                 messages=messages,
                 max_tokens=50,
                 temperature=0.5,
             )
             emotions = response.choices[0].message.content.strip()
-            emotions_list = [emotion.strip() for emotion in emotions.split(',') if emotion.strip()]
+            emotions_list = [emotion.strip() for emotion in emotions.split(",") if emotion.strip()]
             return emotions_list
         except Exception as e:
-            self.loggers["errors"].error(f"Emotion analysis failed: {str(e)}")
+            self.loggers["errors"].error(f"Emotion analysis failed: {e}")
             return []
 
     def extract_keywords(self, text: str) -> List[str]:
@@ -900,12 +831,12 @@ class EnhancedEntityProcessor:
             List[str]: A list of extracted keywords.
         """
         try:
-            kw_extractor = yake.KeywordExtractor(lan='en', n=1, top=10)
+            kw_extractor = yake.KeywordExtractor(lan="en", n=1, top=10)
             keywords = kw_extractor.extract_keywords(text)
             keywords_list = [kw[0] for kw in keywords]
             return keywords_list
         except Exception as e:
-            self.loggers["errors"].error(f"Keyword extraction failed: {str(e)}")
+            self.loggers["errors"].error(f"Keyword extraction failed: {e}")
             return []
 
     def detect_language(self, text: str) -> str:
@@ -922,10 +853,10 @@ class EnhancedEntityProcessor:
             language = detect(text)
             return language
         except Exception as e:
-            self.loggers["errors"].error(f"Language detection failed: {str(e)}")
+            self.loggers["errors"].error(f"Language detection failed: {e}")
             return "unknown"
 
-    async def translate_text(self, text: str, target_lang: str = 'en') -> str:
+    async def translate_text(self, text: str, target_lang: str = "en") -> str:
         """
         Translate the given text to the target language.
 
@@ -937,7 +868,6 @@ class EnhancedEntityProcessor:
             str: The translated text.
         """
         # Placeholder for actual translation logic
-        # You can integrate with a translation API like Google Translate or DeepL
         self.loggers["main"].info("Translation functionality not implemented. Returning original text.")
         return text  # Assuming text is already in English or translation is not implemented
 
@@ -953,9 +883,7 @@ class EnhancedEntityProcessor:
         self.loggers["main"].info("Knowledge graph generation not implemented.")
 
     @retry_async()
-    async def process_story_async(
-        self, story_id: str, content: str
-    ) -> ProcessingResult:
+    async def process_story_async(self, story_id: str, content: str) -> ProcessingResult:
         """
         Process a single story asynchronously, including preprocessing, entity resolution,
         embedding generation, and storing in Qdrant.
@@ -979,15 +907,11 @@ class EnhancedEntityProcessor:
             corrected_content = await asyncio.get_running_loop().run_in_executor(
                 None, preprocess_text_worker, corrected_content
             )
-            self.loggers["main"].debug(
-                f"Preprocessing completed for story '{story_id}'"
-            )
+            self.loggers["main"].debug(f"Preprocessing completed for story '{story_id}'")
             resolved_entities = await asyncio.get_running_loop().run_in_executor(
                 None, extract_and_resolve_entities_worker, corrected_content
             )
-            self.loggers["main"].debug(
-                f"Entities extracted for story '{story_id}': {resolved_entities}"
-            )
+            self.loggers["main"].debug(f"Entities extracted for story '{story_id}': {resolved_entities}")
             wiki_info = await self.get_entities_info(resolved_entities, corrected_content)
 
             # Perform additional analyses
@@ -998,11 +922,45 @@ class EnhancedEntityProcessor:
             relations = await self.extract_entity_relations(
                 [entity['text'] for entity in resolved_entities], corrected_content
             )
-            summary = await self._summarize_text(corrected_content)
 
-            # Generate knowledge graph (placeholder)
-            self.generate_knowledge_graph(resolved_entities, relations)
+            # Generate analysis using the updated generate_analysis method
+            self.loggers["llm"].debug(f"Generating analysis for story '{story_id}'")
+            analysis = await self.report_post_processor.generate_analysis(
+                corrected_content,
+                resolved_entities,
+                wiki_info,
+                sentiment=sentiment,
+                concepts=concepts,
+                emotions=emotions,
+                keywords=keywords,
+                relations=relations,
+                summary=None  # Summary is now handled within generate_analysis
+            )
+            self.loggers["llm"].debug(f"Analysis generated for story '{story_id}'")
+            await self._save_intermediary_data_async(
+                data=analysis,
+                path=f"analysis/{story_id}.json",
+                data_type="analysis",
+            )
 
+            # Create an instance of StoryAnalysisResult
+            result_data = StoryAnalysisResult(
+                story_id=story_id,
+                language=language,
+                corrected_content=corrected_content,
+                entities=resolved_entities,
+                wiki_info=wiki_info,
+                sentiment=sentiment,
+                concepts=concepts,
+                emotions=emotions,
+                keywords=keywords,
+                relations=relations,
+                summary=analysis,  # Assuming generate_analysis returns a string summary
+                embedding=[],  # Placeholder if embedding is handled elsewhere
+                analysis=analysis  # Assuming generate_analysis returns a string
+            )
+
+            # Generate embedding if required
             self.loggers["llm"].debug(f"Generating embedding for story '{story_id}'")
             embedding = await self._get_embedding_async(corrected_content)
             self.loggers["llm"].debug(f"Embedding generated for story '{story_id}'")
@@ -1011,6 +969,8 @@ class EnhancedEntityProcessor:
                 path=f"embeddings/{story_id}.json",
                 data_type="embedding",
             )
+
+            # Store the corrected content and embedding in Qdrant
             story_uuid = self._generate_report_id()
             points = self._prepare_qdrant_points(
                 self.stories_collection_name,
@@ -1023,47 +983,36 @@ class EnhancedEntityProcessor:
             await self._store_points_in_qdrant(
                 self.stories_collection_name, points
             )
-            self.loggers["main"].debug(
-                f"Stored embedding in Qdrant for story '{story_id}'"
+            self.loggers["main"].debug(f"Stored embedding in Qdrant for story '{story_id}'")
+
+            # Store the refined analysis in Qdrant
+            report_id = self._generate_report_id()
+            report_embedding = await self._get_embedding_async(result_data.analysis)
+            report_points = self._prepare_qdrant_points(
+                self.reports_collection_name,
+                report_id,
+                result_data.analysis,
+                wiki_info,
+                report_embedding,
+                story_id,
             )
-            self.loggers["llm"].debug(f"Generating analysis for story '{story_id}'")
-            analysis = await self.report_post_processor.generate_analysis(
-                corrected_content, resolved_entities, wiki_info
+            await self._store_points_in_qdrant(
+                self.reports_collection_name, report_points
             )
-            self.loggers["llm"].debug(f"Analysis generated for story '{story_id}'")
-            await self._save_intermediary_data_async(
-                data=analysis,
-                path=f"analysis/{story_id}.json",
-                data_type="analysis",
+            self.loggers["main"].info(
+                f"Refined report for story '{story_id}' stored in '{self.reports_collection_name}' collection."
             )
-            # Removed visualization generation
-            result = {
-                "story_id": story_id,
-                "language": language,
-                "entities": resolved_entities,
-                "wiki_info": wiki_info,
-                "analysis": analysis,
-                "embedding": embedding,
-                "sentiment": sentiment,
-                "concepts": concepts,
-                "emotions": emotions,
-                "keywords": keywords,
-                "relations": relations,
-                "summary": summary,
-                "timestamp": datetime.now().isoformat(),
-                # "entity_frequency_chart": chart_path  # Removed
-            }
+
+            # Assign the embedding to the result data
+            result_data.embedding = embedding
+
             self.loggers["main"].info(f"Successfully processed story '{story_id}'")
-            return ProcessingResult(success=True, data=result)
+            return ProcessingResult(success=True, data=result_data)
         except ProcessingError as pe:
-            self.loggers["errors"].error(
-                f"Failed to process story '{story_id}': {str(pe)}"
-            )
+            self.loggers["errors"].error(f"Failed to process story '{story_id}': {pe}")
             return ProcessingResult(success=False, error=str(pe))
         except Exception as e:
-            self.loggers["errors"].error(
-                f"Failed to process story '{story_id}': {str(e)}"
-            )
+            self.loggers["errors"].error(f"Failed to process story '{story_id}': {e}")
             return ProcessingResult(success=False, error=str(e))
 
     async def process_stories_async(
@@ -1100,9 +1049,9 @@ class EnhancedEntityProcessor:
                 if isinstance(result, ProcessingResult):
                     processed_results.append(result)
                     if result.success and result.data:
-                        wiki_info[result.data["story_id"]] = result.data.get("wiki_info", {})
+                        wiki_info[result.data.story_id] = result.data.wiki_info
                 elif isinstance(result, Exception):
-                    self.loggers["errors"].error(f"Error processing story: {str(result)}")
+                    self.loggers["errors"].error(f"Error processing story: {result}")
                     processed_results.append(
                         ProcessingResult(success=False, error=str(result))
                     )
@@ -1123,18 +1072,16 @@ class EnhancedEntityProcessor:
             # Store refined reports in Qdrant
             for result in processed_results:
                 if result.success and result.data:
-                    story_id = result.data["story_id"]
-                    report_content = result.data["analysis"]
-                    wiki_info_content = json.dumps(
-                        result.data["wiki_info"], indent=2
-                    )
+                    story_id = result.data.story_id
+                    report_content = result.data.analysis
+                    wiki_info_content = json.dumps(result.data.wiki_info, indent=2)
                     report_id = self._generate_report_id()
                     embedding = await self._get_embedding_async(report_content)
                     report_points = self._prepare_qdrant_points(
                         self.reports_collection_name,
                         report_id,
                         report_content,
-                        result.data["wiki_info"],
+                        result.data.wiki_info,
                         embedding,
                         story_id,
                     )
@@ -1145,29 +1092,15 @@ class EnhancedEntityProcessor:
                         f"Refined report for story '{story_id}' stored in '{self.reports_collection_name}' collection."
                     )
 
-            # Retrieve all reports for summary
-            all_reports = await self._retrieve_all_reports_async(
-                self.reports_collection_name
-            )
-            if not all_reports:
-                self.loggers["main"].warning(
-                    "No reports found in the reports collection to generate a summary."
-                )
-                summary = "No reports available to generate a summary."
-            else:
-                self.loggers["llm"].debug(
-                    "Generating summary from all stored reports"
-                )
-                summary = await self.report_post_processor.generate_summary(all_reports)
-            await self._save_report_async(summary, summary_output_path)
+            # Generate summary report
+            await self.generate_summary_report(summary_output_path)
 
-            # Removed visualization generation
             self.loggers["main"].info(
                 f"Processing complete. Refined reports saved to '{self.reports_collection_name}' and summary saved to {summary_output_path}"
             )
         except Exception as e:
             self.loggers["errors"].error(
-                f"Failed to process stories: {str(e)}", exc_info=True
+                f"Failed to process stories: {e}", exc_info=True
             )
         finally:
             if self.session:
@@ -1202,20 +1135,23 @@ class EnhancedEntityProcessor:
         self.stories = {}
         for story_file in stories_path.glob("*.md"):
             try:
-                with open(
-                    story_file, "r", encoding="utf-8", errors="replace"
-                ) as f:
-                    content = f.read().strip()
-                    if not content:
-                        self.loggers["wikipedia"].warning(
-                            f"Story file '{story_file}' is empty. Skipping."
-                        )
-                        continue
-                    self.stories[story_file.stem] = content
-                    self.loggers["main"].debug(f"Loaded story '{story_file.stem}'")
+                async def read_file():
+                    async with aiofiles.open(
+                        story_file, "r", encoding="utf-8", errors="replace"
+                    ) as f:
+                        return await f.read()
+
+                content = asyncio.run(read_file()).strip()
+                if not content:
+                    self.loggers["wikipedia"].warning(
+                        f"Story file '{story_file}' is empty. Skipping."
+                    )
+                    continue
+                self.stories[story_file.stem] = content
+                self.loggers["main"].debug(f"Loaded story '{story_file.stem}'")
             except Exception as e:
                 self.loggers["errors"].error(
-                    f"Failed to read story file '{story_file}': {str(e)}"
+                    f"Failed to read story file '{story_file}': {e}"
                 )
                 continue
         if not self.stories:
@@ -1242,7 +1178,7 @@ class EnhancedEntityProcessor:
             self.loggers["main"].info(f"Report saved to {output_path}")
         except Exception as e:
             self.loggers["errors"].error(
-                f"Failed to save report to '{output_path}': {str(e)}"
+                f"Failed to save report to '{output_path}': {e}"
             )
 
     async def _save_intermediary_data_async(
@@ -1286,7 +1222,7 @@ class EnhancedEntityProcessor:
                 )
         except Exception as e:
             self.loggers["errors"].error(
-                f"Failed to save intermediary data to '{path}': {str(e)}"
+                f"Failed to save intermediary data to '{path}': {e}"
             )
 
     def _retrieve_all_reports_sync(self, collection_name: str) -> List[str]:
@@ -1301,45 +1237,38 @@ class EnhancedEntityProcessor:
         """
         try:
             all_reports = []
-            limit = self.config_manager.config.get("qdrant", {}).get(
-                "settings", {}
-            ).get("retrieve_limit", 1000)
-            scroll_result = self.qdrant_client.scroll(
+            limit = self.config_manager.get_qdrant_config().get("retrieve_limit", 1000)
+            scroll_result, _ = self.qdrant_client.scroll(
                 collection_name=collection_name,
                 limit=limit,
                 with_payload=True,
                 with_vectors=False,
             )
-            if scroll_result is None:
+            if not scroll_result:
                 self.loggers["main"].warning(
                     f"No data returned from '{collection_name}' collection."
                 )
                 return all_reports
-            for batch in scroll_result:
-                if not batch:
-                    break
-                for record in batch:
-                    if isinstance(record, models.Record) and record.payload:
-                        content = record.payload.get("content", "")
-                        if content:
-                            all_reports.append(content)
-                    else:
-                        self.loggers["errors"].warning(
-                            f"Unexpected record type or missing payload: {record}"
-                        )
+            for record in scroll_result:
+                if isinstance(record, models.Record) and record.payload:
+                    content = record.payload.get("content", "")
+                    if content:
+                        all_reports.append(content)
+                else:
+                    self.loggers["errors"].warning(
+                        f"Unexpected record type or missing payload: {record}"
+                    )
             self.loggers["main"].info(
                 f"Retrieved {len(all_reports)} reports from '{collection_name}' collection."
             )
             return all_reports
         except Exception as e:
             self.loggers["errors"].error(
-                f"Failed to retrieve reports from '{collection_name}' collection: {str(e)}"
+                f"Failed to retrieve reports from '{collection_name}' collection: {e}"
             )
             return []
 
-    async def _retrieve_all_reports_async(
-        self, collection_name: str
-    ) -> List[str]:
+    async def _retrieve_all_reports_async(self, collection_name: str) -> List[str]:
         """
         Asynchronously retrieve all reports from a specified Qdrant collection.
 
@@ -1390,18 +1319,25 @@ class EnhancedEntityProcessor:
             Dict[str, Any]: Dictionary containing information about each entity.
         """
         wiki_info = {}
+        tasks = []
         for entity_dict in entities:
             # Extract the 'text' field from the entity dictionary
             entity = entity_dict.get('text', None)
             if entity:
-                info = await self.get_entity_info_single(entity, context)
-                if info:
-                    # Perform entity-level sentiment analysis
-                    entity_sentiment = await self.perform_entity_sentiment_analysis(entity, context)
-                    info['sentiment'] = entity_sentiment
-                    wiki_info[entity] = info  # Only store 'text' as the key, not the entire dict
+                tasks.append(self.get_entity_info_single(entity, context))
             else:
                 self.loggers['wikipedia'].error(f"Entity dictionary missing 'text' field: {entity_dict}")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for entity, result in zip([e.get('text') for e in entities if 'text' in e], results):
+            if isinstance(result, dict):
+                # Perform entity-level sentiment analysis
+                entity_sentiment = await self.perform_entity_sentiment_analysis(entity, context)
+                result['sentiment'] = entity_sentiment
+                wiki_info[entity] = result
+            elif isinstance(result, Exception):
+                self.loggers['wikipedia'].error(f"Error fetching info for entity '{entity}': {result}")
+            else:
+                self.loggers['wikipedia'].warning(f"No information found for entity '{entity}'.")
         return wiki_info
 
     @retry
@@ -1444,7 +1380,7 @@ class EnhancedEntityProcessor:
             # Validate the entity using its Wikidata ID
             is_valid = await self.validate_entity(wikidata_id, context)
             if not is_valid:
-                self.loggers["wikipedia"].warning(f"Entity '{entity}' is not valid based on context.")
+                self.loggers["wikipedia"].warning(f"Entity '{wikidata_id}' is not valid based on context.")
                 return None
 
             # Fetch Wikidata entity data
@@ -1455,6 +1391,31 @@ class EnhancedEntityProcessor:
                         data = await resp.json()
                         entities = data.get("entities", {})
                         entity_data = entities.get(wikidata_id, {})
+                        claims = entity_data.get("claims", {})
+                        descriptions = entity_data.get("descriptions", {})
+                        english_description = descriptions.get("en", {}).get("value", "")
+                        # Example validation: Check if the entity has an occupation (P106)
+                        if "P106" in claims:
+                            # Further validate against context
+                            context_keywords = set(context.lower().split())
+                            description_keywords = set(english_description.lower().split())
+                            common_keywords = context_keywords.intersection(description_keywords)
+                            if common_keywords:
+                                self.loggers["wikipedia"].debug(
+                                    f"Entity '{wikidata_id}' aligns with context based on keywords: {common_keywords}"
+                                )
+                                # Continue processing
+                            else:
+                                self.loggers["wikipedia"].warning(
+                                    f"Entity '{wikidata_id}' does not align well with context based on keywords."
+                                )
+                                return None
+                        else:
+                            self.loggers["wikipedia"].warning(
+                                f"Entity '{wikidata_id}' lacks essential properties."
+                            )
+                            return None
+
                         sitelinks = entity_data.get("sitelinks", {})
                         enwiki = sitelinks.get("enwiki", {})
                         wikipedia_title = enwiki.get("title")
@@ -1498,19 +1459,25 @@ class EnhancedEntityProcessor:
                                         aliases.extend(alias.get("value") for alias in lang_aliases)
                                     aliases = list(set(aliases))
 
+                                    categories = []
+                                    if "P910" in claims:  # Additional name
+                                        categories.extend([claim['mainsnak']['datavalue']['value'] for claim in claims["P910"]])
+
                                     info = {
                                         "wikidata_id": wikidata_id,
                                         "title": summary_data.get("title", "No title available"),
                                         "summary": summary_data.get("extract", "No summary available"),
                                         "url": summary_data.get("content_urls", {}).get("desktop", {}).get("page", "#"),
-                                        "categories": [],  # Categories are not available in summary_data
+                                        "categories": categories,
                                         "type": summary_data.get("type", "UNKNOWN"),
                                         "aliases": aliases if aliases else [entity],
+                                        "sentiment": "neutral",  # Placeholder, will be updated later
                                     }
 
                                     # Fetch and add specific sections from the Wikipedia page
                                     sections = await self.get_entity_sections(wikipedia_title)
-                                    info.update({"sections": sections})
+                                    relevant_sections = {k: v for k, v in sections.items() if k in ["Early life", "Career", "Personal life"]}
+                                    info.update({"sections": relevant_sections})
 
                                     # Cache the complete information to avoid future redundant API calls
                                     self.wikipedia_cache[entity] = info
