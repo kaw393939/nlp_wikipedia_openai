@@ -125,6 +125,10 @@ class ReportPostProcessor:
         prompt_system = self.config_manager.get_prompt("report_refinement", "system")
         prompt_user_template = self.config_manager.get_prompt("report_refinement", "user")
 
+        # Ensure that the prompt instructs the LLM to respond in English
+        if "Respond in English" not in prompt_system:
+            prompt_system += "\nRespond in English."
+
         # Prepare the data to fill in the prompt
         relations_str = json.dumps(relations) if relations else "No relations identified."
         prompt_user = prompt_user_template.format(
@@ -478,6 +482,11 @@ class ReportPostProcessor:
 
         prompt_system = self.config_manager.get_prompt("summary_generation", "system")
         prompt_user_template = self.config_manager.get_prompt("summary_generation", "user")
+
+        # Ensure that the prompt instructs the LLM to respond in English
+        if "Respond in English" not in prompt_system:
+            prompt_system += "\nRespond in English."
+
         prompt_user = prompt_user_template.format(reports='\n\n'.join(reports))
 
         messages = [
