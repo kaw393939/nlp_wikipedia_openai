@@ -7,6 +7,8 @@ Here's a simplified `README.md` with basic installation instructions focused on 
 
 The **Story Processor** is a Python-based application that processes text data, extracts entities, generates embeddings, and visualizes results using a variety of NLP and AI tools.
 
+[Read More](description.md)
+
 ## Installation Instructions
 
 ### 1. Clone the Repository
