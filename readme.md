@@ -1,6 +1,5 @@
 Here's a simplified `README.md` with basic installation instructions focused on libraries and dependencies:
 
-```markdown
 # Story Processor Project
 
 ## Overview
